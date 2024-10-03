@@ -4,6 +4,10 @@ Nerd Dictation
 
 *Offline Speech to Text for Desktop Linux.* - See `demo video <https://www.youtube.com/watch?v=T7sR-4DFhpQ>`__.
 
+
+Dusty Goals, Lets integrate an LLM. Want to use it for accurate translation and accurate punctuation.  Would also like to be able to supply a prompt for the engine and temperature of 1?
+
+
 This is a utility that provides simple access speech to text for using in Linux
 without being tied to a desktop environment, using the excellent `VOSK-API <https://github.com/alphacep/vosk-api>`__.
 
