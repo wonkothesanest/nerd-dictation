@@ -1055,6 +1055,8 @@ class WhisperEngine(STTEngine):
         whisper_temperature: float = 0.0,
         whisper_initial_prompt: Optional[str] = None,
         whisper_compute_type: str = "float16",
+        whisper_silence_duration: float = 0.5,
+        whisper_silence_threshold: float = 0.01,
         verbose: int = 0,
     ):
         self.whisper_model = whisper_model
@@ -1064,6 +1066,8 @@ class WhisperEngine(STTEngine):
         self.whisper_temperature = whisper_temperature
         self.whisper_initial_prompt = whisper_initial_prompt
         self.whisper_compute_type = whisper_compute_type
+        self.whisper_silence_duration = whisper_silence_duration
+        self.whisper_silence_threshold = whisper_silence_threshold
         self.verbose = verbose
 
         # Will be initialized in initialize()
@@ -1074,6 +1078,10 @@ class WhisperEngine(STTEngine):
 
         # Final transcription result
         self.final_text = ""
+
+        # Silence detection state
+        self.silence_duration_accumulated = 0.0
+        self.has_speech = False  # Track if we've seen any speech in current buffer
 
     def initialize(self) -> None:
         """Initialize Whisper model."""
@@ -1098,15 +1106,85 @@ class WhisperEngine(STTEngine):
         if self.verbose >= 1:
             sys.stderr.write("Whisper model loaded.\n")
 
+    def _is_silence(self, audio_chunk: bytes) -> bool:
+        """
+        Detect if an audio chunk contains silence based on RMS energy.
+
+        Args:
+            audio_chunk: Raw audio bytes (PCM s16le format)
+
+        Returns:
+            True if the chunk is considered silence, False otherwise
+        """
+        import numpy as np
+
+        # Convert bytes to numpy array (s16le format = signed 16-bit little-endian)
+        audio_array = np.frombuffer(audio_chunk, dtype=np.int16)
+
+        # Calculate RMS (Root Mean Square) energy
+        # This gives us the average amplitude/loudness of the audio
+        if len(audio_array) == 0:
+            return True
+
+        # Normalize to float range [-1.0, 1.0]
+        audio_float = audio_array.astype(np.float32) / 32768.0
+
+        # Calculate RMS energy
+        rms_energy = float(np.sqrt(np.mean(audio_float**2)))
+
+        # Compare against threshold
+        is_silent = rms_energy < self.whisper_silence_threshold
+
+        if self.verbose >= 2:
+            sys.stderr.write(
+                "Audio energy: {:.4f} (threshold: {:.4f}) - {}\n".format(
+                    rms_energy, self.whisper_silence_threshold, "SILENCE" if is_silent else "SPEECH"
+                )
+            )
+
+        return is_silent
+
     def process_audio_chunk(self, data: bytes) -> bool:
         """
-        Buffer audio chunk. Whisper doesn't process streaming data,
-        so we accumulate chunks and process them all at once when done.
+        Buffer audio chunk and detect silence to determine utterance boundaries.
 
-        Returns False always since Whisper has no partial results.
+        When sufficient silence is detected after speech, we transcribe the accumulated audio.
+
+        Returns:
+            True if silence threshold reached and utterance should be transcribed,
+            False otherwise.
         """
+        # Always buffer the audio data
         self.audio_buffer.append(data)
-        return False  # Never has a "final" result until we explicitly transcribe
+
+        # Check if this chunk is silence
+        is_silent = self._is_silence(data)
+
+        # Calculate duration of this chunk
+        # data is s16le (2 bytes per sample)
+        chunk_samples = len(data) // 2
+        chunk_duration = chunk_samples / self.sample_rate
+
+        if is_silent:
+            # Accumulate silence duration
+            self.silence_duration_accumulated += chunk_duration
+
+            # If we've accumulated enough silence AND we've seen speech before,
+            # it's time to transcribe the utterance
+            if self.has_speech and self.silence_duration_accumulated >= self.whisper_silence_duration:
+                if self.verbose >= 1:
+                    sys.stderr.write(
+                        "Detected {:.2f}s of silence, transcribing utterance...\n".format(
+                            self.silence_duration_accumulated
+                        )
+                    )
+                return True  # Signal that we should transcribe now
+        else:
+            # This is speech - reset silence counter and mark that we've seen speech
+            self.silence_duration_accumulated = 0.0
+            self.has_speech = True
+
+        return False  # Keep buffering
 
     def get_partial_result(self) -> str:
         """Whisper doesn't support partial results."""
@@ -1178,9 +1256,11 @@ class WhisperEngine(STTEngine):
             return ""
 
     def reset(self) -> None:
-        """Clear audio buffer."""
+        """Clear audio buffer and silence detection state."""
         self.audio_buffer.clear()
         self.final_text = ""
+        self.silence_duration_accumulated = 0.0
+        self.has_speech = False
 
     def supports_progressive(self) -> bool:
         """Whisper does not support progressive/streaming recognition."""
@@ -1621,6 +1701,8 @@ def main_begin(
     whisper_temperature: float = 0.0,
     whisper_initial_prompt: Optional[str] = None,
     whisper_compute_type: str = "float16",
+    whisper_silence_duration: float = 0.5,
+    whisper_silence_threshold: float = 0.01,
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -1796,6 +1878,8 @@ def main_begin(
             whisper_temperature=whisper_temperature,
             whisper_initial_prompt=whisper_initial_prompt,
             whisper_compute_type=whisper_compute_type,
+            whisper_silence_duration=whisper_silence_duration,
+            whisper_silence_threshold=whisper_silence_threshold,
             verbose=verbose,
         )
         # Whisper doesn't support progressive mode, force deferred output
@@ -2041,6 +2125,34 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
         help=(
             "Compute precision for Whisper (default: float16).\n"
             "float16 is faster, int8 uses less memory, float32 is most accurate."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-silence-duration",
+        default=0.5,
+        dest="whisper_silence_duration",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Duration of silence in seconds to trigger transcription (default: 0.5).\n"
+            "When this much continuous silence is detected after speech, Whisper will transcribe the utterance.\n"
+            "Lower values = more responsive but may cut off speech. Higher values = more patient."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-silence-threshold",
+        default=0.01,
+        dest="whisper_silence_threshold",
+        type=float,
+        metavar="FLOAT",
+        help=(
+            "RMS energy threshold for silence detection (default: 0.01, range: 0.0-1.0).\n"
+            "Audio with energy below this threshold is considered silence.\n"
+            "Lower values = more sensitive (detects quieter speech). Higher values = less sensitive."
         ),
         required=False,
     )
@@ -2331,6 +2443,8 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             whisper_temperature=args.whisper_temperature,
             whisper_initial_prompt=args.whisper_initial_prompt,
             whisper_compute_type=args.whisper_compute_type,
+            whisper_silence_duration=args.whisper_silence_duration,
+            whisper_silence_threshold=args.whisper_silence_threshold,
         ),
     )
 
