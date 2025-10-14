@@ -1,6 +1,6 @@
 # Generic files to ignore.
 .*
-
+vosk*
 # Python temp paths.
 __pycache__/
 *.py[cod]

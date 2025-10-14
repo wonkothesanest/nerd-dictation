@@ -71,11 +71,56 @@ Suspend/Resume
 See ``nerd-dictation begin --help`` for details on how to access these options.
 
 
+Speech Recognition Engines
+===========================
+
+nerd-dictation supports two speech recognition engines:
+
+VOSK (Default)
+--------------
+- Offline speech recognition with streaming support
+- Progressive typing (see text as you speak)
+- Lower memory usage
+- Outputs lowercase text (requires post-processing)
+
+**Installation:**
+
+.. code-block:: sh
+
+   pip3 install vosk
+
+**Quick Start:** See the Install section below.
+
+Whisper (Optional)
+------------------
+- Higher accuracy transcription
+- Automatic punctuation and capitalization
+- Multi-language support with better quality
+- Larger memory footprint
+- Deferred output only (types all text at once)
+
+**Installation:**
+
+.. code-block:: sh
+
+   pip3 install faster-whisper
+
+**Quick Start:**
+
+.. code-block:: sh
+
+   nerd-dictation begin --stt-engine WHISPER --whisper-model base
+   # Speak...
+   nerd-dictation end
+
+**Full Documentation:** See `Using Whisper with nerd-dictation <readme-whisper.rst>`_ for detailed setup, usage, and troubleshooting.
+
+
 Dependencies
 ============
 
 - Python 3.6 (or newer).
-- The VOSK-API.
+- **Speech Recognition:** VOSK-API (required) or faster-whisper (optional).
 - An audio recording utility (``parec`` by default).
 - An input simulation utility (``xdotool`` by default).
 
@@ -416,5 +461,6 @@ Further Work
 ============
 
 - Support a general solution to capitalize words (proper nouns for example).
-- Possibly other speech to text engines *(only if they provide some significant benefits)*.
+- ✓ **Whisper Speech Recognition** - Added OpenAI Whisper support with automatic punctuation and capitalization.
+- Integration with LLMs for post-processing (building on Whisper foundation).
 - Possibly support Windows & macOS.
