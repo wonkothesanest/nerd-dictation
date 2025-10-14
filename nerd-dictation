@@ -19,6 +19,7 @@ import time
 
 # Types.
 from typing import (
+    Any,
     Dict,
     IO,
     List,
@@ -860,6 +861,333 @@ def process_text(
 
 
 # -----------------------------------------------------------------------------
+# Speech-To-Text Engine Abstraction
+#
+
+
+class STTEngine:
+    """
+    Abstract base class for speech-to-text engines.
+
+    This provides a common interface for different STT backends (VOSK, Whisper, etc.)
+    """
+
+    def initialize(self) -> None:
+        """
+        Initialize the engine. Called once before processing begins.
+        Load models, set up recognizers, etc.
+        """
+        raise NotImplementedError()
+
+    def process_audio_chunk(self, data: bytes) -> bool:
+        """
+        Process a chunk of audio data.
+
+        Args:
+            data: Raw audio bytes (PCM s16le format)
+
+        Returns:
+            True if this chunk completed a recognition (final result available),
+            False if still processing (partial result may be available)
+        """
+        raise NotImplementedError()
+
+    def get_partial_result(self) -> str:
+        """
+        Get partial recognition result (work in progress transcription).
+
+        Returns:
+            Partial transcription text, or empty string if none available.
+        """
+        raise NotImplementedError()
+
+    def get_final_result(self) -> str:
+        """
+        Get final recognition result for the completed utterance.
+
+        Returns:
+            Final transcription text, or empty string if none available.
+        """
+        raise NotImplementedError()
+
+    def reset(self) -> None:
+        """
+        Reset the recognizer state (e.g., after suspend/resume).
+        Clears any partial recognition state.
+        """
+        raise NotImplementedError()
+
+    def supports_progressive(self) -> bool:
+        """
+        Returns True if this engine supports progressive/streaming recognition.
+        If False, only deferred output mode is available.
+        """
+        raise NotImplementedError()
+
+
+class VoskEngine(STTEngine):
+    """
+    VOSK speech recognition engine implementation.
+    """
+
+    def __init__(
+        self,
+        *,
+        vosk_model_dir: str,
+        sample_rate: int,
+        vosk_grammar_file: str = "",
+        verbose: int = 0,
+    ):
+        self.vosk_model_dir = vosk_model_dir
+        self.sample_rate = sample_rate
+        self.vosk_grammar_file = vosk_grammar_file
+        self.verbose = verbose
+
+        # Will be initialized in initialize()
+        self.model: "Optional[Any]" = None
+        self.rec: "Optional[Any]" = None
+        self._partial_prev = ""
+
+    def initialize(self) -> None:
+        """Initialize VOSK model and recognizer."""
+        import json
+
+        if not os.path.exists(self.vosk_model_dir):
+            sys.stderr.write(
+                "Please download the model from "
+                "https://alphacephei.com/vosk/models and unpack it to {!r}.\n".format(self.vosk_model_dir)
+            )
+            sys.exit(1)
+
+        # `mypy` doesn't know about VOSK.
+        import vosk  # type: ignore
+
+        vosk.SetLogLevel(-1)
+
+        if not self.vosk_grammar_file:
+            grammar_json = ""
+        else:
+            with open(self.vosk_grammar_file, encoding="utf-8") as fh:
+                grammar_json = fh.read()
+
+        # Allow for loading the model to take some time:
+        if self.verbose >= 1:
+            sys.stderr.write("Loading model...\n")
+        self.model = vosk.Model(self.vosk_model_dir)
+
+        if grammar_json == "":
+            self.rec = vosk.KaldiRecognizer(self.model, self.sample_rate)
+        else:
+            self.rec = vosk.KaldiRecognizer(self.model, self.sample_rate, grammar_json)
+
+        if self.verbose >= 1:
+            sys.stderr.write("Model loaded.\n")
+
+    def process_audio_chunk(self, data: bytes) -> bool:
+        """Process audio chunk with VOSK."""
+        assert self.rec is not None
+        ok = self.rec.AcceptWaveform(data)
+        if ok:
+            self._partial_prev = ""
+        return ok
+
+    def get_partial_result(self) -> str:
+        """Get partial result from VOSK."""
+        import json
+
+        assert self.rec is not None
+        json_text = self.rec.PartialResult()
+
+        # Without this, there are *many* calls with the same partial text.
+        if self._partial_prev != json_text:
+            self._partial_prev = json_text
+            json_data = json.loads(json_text)
+            # In rare cases this can be unset (when resuming from being suspended).
+            text = json_data.get("partial", "")
+            return text
+        return ""
+
+    def get_final_result(self) -> str:
+        """Get final result from VOSK."""
+        import json
+
+        assert self.rec is not None
+        json_text = self.rec.FinalResult()
+
+        # When `rec.FinalResult()` returns an empty string, typically immediately after a resume,
+        # it can cause the JSON decoder to fail. This patch simply ignores that case and continues
+        # by returning an empty string to the caller.
+        if not json_text:
+            return ""
+
+        assert isinstance(json_text, str)
+        json_data = json.loads(json_text)
+        text = json_data["text"]
+        assert isinstance(text, str)
+        return text
+
+    def reset(self) -> None:
+        """Reset VOSK recognizer."""
+        assert self.rec is not None
+        self.rec.Reset()
+        self._partial_prev = ""
+
+    def supports_progressive(self) -> bool:
+        """VOSK supports progressive recognition."""
+        return True
+
+
+class WhisperEngine(STTEngine):
+    """
+    Whisper speech recognition engine implementation using faster-whisper.
+
+    Unlike VOSK, Whisper processes complete audio files rather than streaming chunks.
+    This means it only supports deferred output mode (no progressive typing).
+    """
+
+    def __init__(
+        self,
+        *,
+        whisper_model: str,
+        whisper_model_dir: str,
+        sample_rate: int,
+        whisper_language: Optional[str] = None,
+        whisper_temperature: float = 0.0,
+        whisper_initial_prompt: Optional[str] = None,
+        whisper_compute_type: str = "float16",
+        verbose: int = 0,
+    ):
+        self.whisper_model = whisper_model
+        self.whisper_model_dir = whisper_model_dir
+        self.sample_rate = sample_rate
+        self.whisper_language = whisper_language
+        self.whisper_temperature = whisper_temperature
+        self.whisper_initial_prompt = whisper_initial_prompt
+        self.whisper_compute_type = whisper_compute_type
+        self.verbose = verbose
+
+        # Will be initialized in initialize()
+        self.model: "Optional[Any]" = None
+
+        # Audio buffer for accumulating chunks
+        self.audio_buffer: List[bytes] = []
+
+        # Final transcription result
+        self.final_text = ""
+
+    def initialize(self) -> None:
+        """Initialize Whisper model."""
+        from faster_whisper import WhisperModel
+
+        if self.verbose >= 1:
+            sys.stderr.write("Loading Whisper model ({})...\n".format(self.whisper_model))
+
+        # Create model directory if it doesn't exist
+        if not os.path.exists(self.whisper_model_dir):
+            os.makedirs(self.whisper_model_dir, exist_ok=True)
+
+        # Load the model
+        # faster-whisper will automatically download the model if not present
+        self.model = WhisperModel(
+            self.whisper_model,
+            device="cpu",  # Use CPU (could add GPU support later)
+            compute_type=self.whisper_compute_type,
+            download_root=self.whisper_model_dir,
+        )
+
+        if self.verbose >= 1:
+            sys.stderr.write("Whisper model loaded.\n")
+
+    def process_audio_chunk(self, data: bytes) -> bool:
+        """
+        Buffer audio chunk. Whisper doesn't process streaming data,
+        so we accumulate chunks and process them all at once when done.
+
+        Returns False always since Whisper has no partial results.
+        """
+        self.audio_buffer.append(data)
+        return False  # Never has a "final" result until we explicitly transcribe
+
+    def get_partial_result(self) -> str:
+        """Whisper doesn't support partial results."""
+        return ""
+
+    def get_final_result(self) -> str:
+        """
+        Transcribe the accumulated audio buffer and return the result.
+        This is called when recording ends.
+        """
+        if not self.audio_buffer:
+            return ""
+
+        # If we've already transcribed, return the cached result
+        if self.final_text:
+            result = self.final_text
+            self.final_text = ""  # Clear for next use
+            return result
+
+        # Convert audio buffer to numpy array
+        import numpy as np
+
+        # Combine all audio chunks
+        audio_data = b"".join(self.audio_buffer)
+
+        # Convert bytes to numpy array (s16le format = signed 16-bit little-endian)
+        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+
+        # Convert to float32 in range [-1.0, 1.0] as required by Whisper
+        audio_float = audio_array.astype(np.float32) / 32768.0
+
+        if self.verbose >= 1:
+            duration = len(audio_float) / self.sample_rate
+            sys.stderr.write("Transcribing {:.1f}s of audio...\n".format(duration))
+
+        # Transcribe with Whisper
+        assert self.model is not None
+
+        # Build transcription options
+        transcribe_options = {
+            "language": self.whisper_language,
+            "temperature": self.whisper_temperature,
+            "initial_prompt": self.whisper_initial_prompt,
+        }
+
+        # Remove None values
+        transcribe_options = {k: v for k, v in transcribe_options.items() if v is not None}
+
+        try:
+            segments, info = self.model.transcribe(
+                audio_float,
+                **transcribe_options
+            )
+
+            # Collect all segments into final text
+            text_parts = []
+            for segment in segments:
+                text_parts.append(segment.text)
+
+            result = "".join(text_parts).strip()
+
+            if self.verbose >= 1:
+                sys.stderr.write("Transcription complete: {!r}\n".format(result))
+
+            return result
+
+        except Exception as ex:
+            sys.stderr.write("Whisper transcription error: {!s}\n".format(ex))
+            return ""
+
+    def reset(self) -> None:
+        """Clear audio buffer."""
+        self.audio_buffer.clear()
+        self.final_text = ""
+
+    def supports_progressive(self) -> bool:
+        """Whisper does not support progressive/streaming recognition."""
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Text from VOSK
 #
 
@@ -925,9 +1253,9 @@ def recording_proc_with_non_blocking_stdout(
     return ps, stdout
 
 
-def text_from_vosk_pipe(
+def text_from_stt_engine(
     *,
-    vosk_model_dir: str,
+    stt_engine: STTEngine,
     exit_fn: Callable[..., int],
     process_fn: Callable[[str], str],
     handle_fn: Callable[[int, str], None],
@@ -940,18 +1268,7 @@ def text_from_vosk_pipe(
     pulse_device_name: str = "",
     suspend_on_start: bool = False,
     verbose: int = 0,
-    vosk_grammar_file: str = "",
 ) -> bool:
-    # Delay some imports until recording has started to avoid minor delays.
-    import json
-
-    if not os.path.exists(vosk_model_dir):
-        sys.stderr.write(
-            "Please download the model from "
-            "https://alphacephei.com/vosk/models and unpack it to {!r}.\n".format(vosk_model_dir)
-        )
-        sys.exit(1)
-
     # NOTE: typed as a string for Py3.6 compatibility.
     def recording_proc_start() -> "Tuple[subprocess.Popen[bytes], IO[bytes]]":
         return recording_proc_with_non_blocking_stdout(input_method, sample_rate, pulse_device_name)
@@ -961,29 +1278,8 @@ def text_from_vosk_pipe(
         ps, stdout = recording_proc_start()
         has_ps = True
 
-    # `mypy` doesn't know about VOSK.
-    import vosk  # type: ignore
-
-    vosk.SetLogLevel(-1)
-
-    if not vosk_grammar_file:
-        grammar_json = ""
-    else:
-        with open(vosk_grammar_file, encoding="utf-8") as fh:
-            grammar_json = fh.read()
-
-    # Allow for loading the model to take some time:
-    if verbose >= 1:
-        sys.stderr.write("Loading model...\n")
-    model = vosk.Model(vosk_model_dir)
-
-    if grammar_json == "":
-        rec = vosk.KaldiRecognizer(model, sample_rate)
-    else:
-        rec = vosk.KaldiRecognizer(model, sample_rate, grammar_json)
-
-    if verbose >= 1:
-        sys.stderr.write("Model loaded.\n")
+    # Initialize the STT engine (loads model, etc.)
+    stt_engine.initialize()
 
     # 1mb
     block_size = 1_048_576
@@ -1003,8 +1299,8 @@ def text_from_vosk_pipe(
     if progressive:
         text_prev = ""
 
-    # Track this to prevent excessive load when the "partial" result doesn't change.
-    json_text_partial_prev = ""
+    # Track the last result to detect changes (for timeouts).
+    last_result_text = ""
 
     # -----------------------------
     # Utilities for Text Processing
@@ -1012,11 +1308,9 @@ def text_from_vosk_pipe(
     def handle_fn_suspended() -> None:
         nonlocal handled_any
         nonlocal text_prev
-        nonlocal json_text_partial_prev
 
         handled_any = False
         text_prev = ""
-        json_text_partial_prev = ""
 
         if not (progressive and progressive_continuous):
             text_list.clear()
@@ -1060,37 +1354,21 @@ def text_from_vosk_pipe(
         handled_any = True
 
     # -----------------------------------------------
-    # Utilities for accessing results on `rec` (VOSK)
+    # Utilities for accessing results from STT engine
 
-    def rec_handle_fn_wrapper_from_final_result() -> str:
-        json_text = rec.FinalResult()
-
-        # When `rec.FinalResult()` returns an empty string, typically immediately after a resume,
-        # it can cause the JSON decoder to fail. This patch simply ignores that case and continues
-        # by returning an empty string to the caller.
-        if not json_text:
-            return ""
-
-        assert isinstance(json_text, str)
-        json_data = json.loads(json_text)
-        text = json_data["text"]
-        assert isinstance(text, str)
+    def engine_handle_final_result() -> str:
+        """Get and process final result from engine."""
+        text = stt_engine.get_final_result()
         if text:
             handle_fn_wrapper(text, False)
-        return json_text
+        return text
 
-    def rec_handle_fn_wrapper_from_partial_result(json_text_partial_prev: str) -> Tuple[str, str]:
-        json_text = rec.PartialResult()
-        # Without this, there are *many* calls with the same partial text.
-        if json_text_partial_prev != json_text:
-            json_text_partial_prev = json_text
-
-            json_data = json.loads(json_text)
-            # In rare cases this can be unset (when resuming from being suspended).
-            text = json_data.get("partial", "")
-            if text:
-                handle_fn_wrapper(text, True)
-        return json_text, json_text_partial_prev
+    def engine_handle_partial_result() -> str:
+        """Get and process partial result from engine."""
+        text = stt_engine.get_partial_result()
+        if text:
+            handle_fn_wrapper(text, True)
+        return text
 
     if not suspend_on_start:
         # Support setting up input simulation state.
@@ -1108,10 +1386,10 @@ def text_from_vosk_pipe(
 
     def do_suspend_pause() -> None:
         nonlocal has_ps, ps, stdout
-        rec_handle_fn_wrapper_from_final_result()
+        engine_handle_final_result()
 
         # Don't include any of the current analysis when resuming.
-        rec.Reset()
+        stt_engine.reset()
 
         # Clear the buffer:
         handle_fn_suspended()
@@ -1225,18 +1503,17 @@ def text_from_vosk_pipe(
             continue
 
         if data:
-            ok = rec.AcceptWaveform(data)
-            if ok:
-                json_text_partial_prev = ""
-                json_text = rec_handle_fn_wrapper_from_final_result()
+            is_final = stt_engine.process_audio_chunk(data)
+            if is_final:
+                result_text = engine_handle_final_result()
             else:
-                json_text, json_text_partial_prev = rec_handle_fn_wrapper_from_partial_result(json_text_partial_prev)
+                result_text = engine_handle_partial_result()
 
-            # Monitor the partial output.
+            # Monitor the output.
             # Finish if no changes are made for `timeout` seconds.
             if use_timeout:
-                if json_text != timeout_text_prev:
-                    timeout_text_prev = json_text
+                if result_text and result_text != timeout_text_prev:
+                    timeout_text_prev = result_text
                     timeout_time_prev = time.time()
                 elif time.time() - timeout_time_prev > timeout:
                     if code == 0:
@@ -1256,14 +1533,61 @@ def text_from_vosk_pipe(
         sys.stderr.write("Text input canceled!\n")
         sys.exit(0)
 
-    # This writes many JSON blocks, use the last one.
-    rec_handle_fn_wrapper_from_final_result()
+    # Get final result from engine.
+    engine_handle_final_result()
 
     if not progressive:
         # We never arrive here needing deletions
         handle_fn(0, process_fn(" ".join(text_list)))
 
     return handled_any
+
+
+def text_from_vosk_pipe(
+    *,
+    vosk_model_dir: str,
+    exit_fn: Callable[..., int],
+    process_fn: Callable[[str], str],
+    handle_fn: Callable[[int, str], None],
+    timeout: float,
+    idle_time: float,
+    progressive: bool,
+    progressive_continuous: bool,
+    sample_rate: int,
+    input_method: str,
+    pulse_device_name: str = "",
+    suspend_on_start: bool = False,
+    verbose: int = 0,
+    vosk_grammar_file: str = "",
+) -> bool:
+    """
+    Wrapper for text_from_stt_engine() using VOSK engine.
+    Maintains backward compatibility with existing code.
+    """
+    # Create VOSK engine
+    engine = VoskEngine(
+        vosk_model_dir=vosk_model_dir,
+        sample_rate=sample_rate,
+        vosk_grammar_file=vosk_grammar_file,
+        verbose=verbose,
+    )
+
+    # Call generic STT engine function
+    return text_from_stt_engine(
+        stt_engine=engine,
+        exit_fn=exit_fn,
+        process_fn=process_fn,
+        handle_fn=handle_fn,
+        timeout=timeout,
+        idle_time=idle_time,
+        progressive=progressive,
+        progressive_continuous=progressive_continuous,
+        sample_rate=sample_rate,
+        input_method=input_method,
+        pulse_device_name=pulse_device_name,
+        suspend_on_start=suspend_on_start,
+        verbose=verbose,
+    )
 
 
 def main_begin(
@@ -1290,6 +1614,13 @@ def main_begin(
     suspend_on_start: bool = False,
     verbose: int = 0,
     vosk_grammar_file: str = "",
+    stt_engine: str = "VOSK",
+    whisper_model: str = "base",
+    whisper_model_dir: str = "",
+    whisper_language: Optional[str] = None,
+    whisper_temperature: float = 0.0,
+    whisper_initial_prompt: Optional[str] = None,
+    whisper_compute_type: str = "float16",
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -1297,12 +1628,18 @@ def main_begin(
     This is terminated by the ``end`` or ``cancel`` actions.
     """
 
-    # Find language model in:
-    # - `--vosk-model-dir=...`
-    # - `~/.config/nerd-dictation/model`
-    if not vosk_model_dir:
-        vosk_model_dir = calc_user_config_path("model")
-        # If this still doesn't exist the error is handled later.
+    # Set up model directories based on engine
+    if stt_engine == "VOSK":
+        # Find language model in:
+        # - `--vosk-model-dir=...`
+        # - `~/.config/nerd-dictation/model`
+        if not vosk_model_dir:
+            vosk_model_dir = calc_user_config_path("model")
+            # If this still doesn't exist the error is handled later.
+    elif stt_engine == "WHISPER":
+        # Set default Whisper model directory
+        if not whisper_model_dir:
+            whisper_model_dir = calc_user_config_path("whisper-models")
 
     #
     # Initialize the recording state and perform some sanity checks.
@@ -1442,8 +1779,38 @@ def main_begin(
         # Unreachable.
         assert False
 
-    found_any = text_from_vosk_pipe(
-        vosk_model_dir=vosk_model_dir,
+    # Create the appropriate STT engine
+    if stt_engine == "VOSK":
+        engine = VoskEngine(
+            vosk_model_dir=vosk_model_dir,
+            sample_rate=sample_rate,
+            vosk_grammar_file=vosk_grammar_file,
+            verbose=verbose,
+        )
+    elif stt_engine == "WHISPER":
+        engine = WhisperEngine(
+            whisper_model=whisper_model,
+            whisper_model_dir=whisper_model_dir,
+            sample_rate=sample_rate,
+            whisper_language=whisper_language,
+            whisper_temperature=whisper_temperature,
+            whisper_initial_prompt=whisper_initial_prompt,
+            whisper_compute_type=whisper_compute_type,
+            verbose=verbose,
+        )
+        # Whisper doesn't support progressive mode, force deferred output
+        if progressive:
+            sys.stderr.write(
+                "Warning: Whisper engine does not support progressive output. "
+                "Using deferred output mode instead.\n"
+            )
+            progressive = False
+    else:
+        sys.stderr.write("Unknown STT engine: {!r}\n".format(stt_engine))
+        sys.exit(1)
+
+    found_any = text_from_stt_engine(
+        stt_engine=engine,
         pulse_device_name=pulse_device_name,
         sample_rate=sample_rate,
         input_method=input_method,
@@ -1456,7 +1823,6 @@ def main_begin(
         handle_fn=handle_fn,
         suspend_on_start=suspend_on_start,
         verbose=verbose,
-        vosk_grammar_file=vosk_grammar_file,
     )
 
     if not found_any:
@@ -1581,6 +1947,100 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             "Path to a JSON grammar file.  This restricts the phrases recognized by VOSK for\n"
             "better accuracy.  See `vosk_recognizer_new_grm` in the API reference:\n"
             "https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--stt-engine",
+        default="VOSK",
+        dest="stt_engine",
+        type=str,
+        metavar="ENGINE",
+        choices=("VOSK", "WHISPER"),
+        help=(
+            "Speech-to-text engine to use (default: VOSK).\n"
+            "\n"
+            "- ``VOSK`` (default): Offline VOSK-API engine with streaming support.\n"
+            "- ``WHISPER``: OpenAI Whisper via faster-whisper (requires: pip install faster-whisper).\n"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-model",
+        default="base",
+        dest="whisper_model",
+        type=str,
+        metavar="MODEL",
+        help=(
+            "Whisper model to use: tiny, base, small, medium, large, turbo (default: base).\n"
+            "Larger models are more accurate but slower and use more memory."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-model-dir",
+        default="",
+        dest="whisper_model_dir",
+        type=str,
+        metavar="DIR",
+        help=(
+            "Directory to store Whisper models (default: ~/.config/nerd-dictation/whisper-models/)."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-language",
+        default=None,
+        dest="whisper_language",
+        type=str,
+        metavar="LANG",
+        help=(
+            "Language code for Whisper transcription (e.g., 'en', 'es', 'fr').\n"
+            "If not specified, Whisper will auto-detect the language."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-temperature",
+        default=0.0,
+        dest="whisper_temperature",
+        type=float,
+        metavar="FLOAT",
+        help=(
+            "Temperature for Whisper sampling, 0.0 to 1.0 (default: 0.0).\n"
+            "Higher values increase randomness. 0.0 is deterministic (most accurate)."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-initial-prompt",
+        default=None,
+        dest="whisper_initial_prompt",
+        type=str,
+        metavar="TEXT",
+        help=(
+            "Initial prompt to guide Whisper's transcription style.\n"
+            'Example: "Technical dictation with proper punctuation."'
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-compute-type",
+        default="float16",
+        dest="whisper_compute_type",
+        type=str,
+        metavar="TYPE",
+        choices=("float16", "float32", "int8"),
+        help=(
+            "Compute precision for Whisper (default: float16).\n"
+            "float16 is faster, int8 uses less memory, float32 is most accurate."
         ),
         required=False,
     )
@@ -1864,6 +2324,13 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             suspend_on_start=args.suspend_on_start,
             verbose=args.verbose,
             vosk_grammar_file=args.vosk_grammar_file,
+            stt_engine=args.stt_engine,
+            whisper_model=args.whisper_model,
+            whisper_model_dir=args.whisper_model_dir,
+            whisper_language=args.whisper_language,
+            whisper_temperature=args.whisper_temperature,
+            whisper_initial_prompt=args.whisper_initial_prompt,
+            whisper_compute_type=args.whisper_compute_type,
         ),
     )
 
