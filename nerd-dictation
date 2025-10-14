@@ -287,9 +287,7 @@ def simulate_typing_with_wtype(delete_prev_chars: int, text: str) -> None:
 # -----------------------------------------------------------------------------
 # Simulate Input: STDOUT
 #
-def simulate_typing_with_stout(delete_prev_chars: int, text: str) -> None:
-    cmd = "stdout"
-
+def simulate_typing_with_stdout(delete_prev_chars: int, text: str) -> None:
     # No setup/tear-down.
     if delete_prev_chars == SIMULATE_INPUT_CODE_COMMAND:
         return
@@ -590,9 +588,9 @@ class from_words_to_digits:
         valid_unit_words = from_words_to_digits.valid_unit_words
         number_words = from_words_to_digits._number_words
 
-        if not w_prev in valid_unit_words:
+        if w_prev not in valid_unit_words:
             return False
-        if not w in valid_unit_words:
+        if w not in valid_unit_words:
             return False
         increment_prev = number_words[w_prev][1]
         increment = number_words[w][1]
@@ -901,6 +899,16 @@ def recording_proc_with_non_blocking_stdout(
             "-t",
             "raw",
             "-L",
+            "-",
+        )
+    elif input_method == "PW-CAT":
+        cmd = (
+            "pw-cat",
+            "--record",
+            "--format=s16",
+            "--rate",
+            str(sample_rate),
+            "--channels=1",
             "-",
         )
     else:
@@ -1415,7 +1423,7 @@ def main_begin(
         elif simulate_input_tool == "WTYPE":
             handle_fn = simulate_typing_with_wtype
         elif simulate_input_tool == "STDOUT":
-            handle_fn = simulate_typing_with_stout
+            handle_fn = simulate_typing_with_stdout
         else:
             raise Exception("Internal error, unknown input tool: {!r}".format(simulate_input_tool))
 
@@ -1758,14 +1766,15 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
         default="PAREC",
         type=str,
         metavar="INPUT_METHOD",
-        choices=("PAREC", "SOX"),
+        choices=("PAREC", "SOX", "PW-CAT"),
         help=(
-            "Specify input method to be used for audio recording. Valid methods: PAREC, SOX\n"
+            "Specify input method to be used for audio recording. Valid methods: PAREC, SOX, PW-CAT.\n"
             "\n"
             "- ``PAREC`` (external command, default)\n"
             "  See --pulse-device-name option to use a specific pulse-audio device.\n"
             "- ``SOX`` (external command)\n"
             "  For help on setting up sox, see ``readme-sox.rst`` in the nerd-dictation repository.\n"
+            "- ``PW-CAT`` (external command)\n"
         ),
         required=False,
     )
