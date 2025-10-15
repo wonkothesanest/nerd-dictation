@@ -1044,10 +1044,16 @@ class WhisperEngine(STTEngine):
     Uses a two-tier silence detection system with background transcription:
     - Short pause (whisper_silence_duration, default 0.5s): Transcribe new audio since last pause, append output
     - Long pause (whisper_silence_finalize, default 2.0s): Re-transcribe entire buffer with full context,
-      replace all previous output with properly formatted result, then clear buffer
+      replace previous output with properly formatted result, then clear buffer
+
+    Output handling uses VOSK-style diff algorithm to minimize backspaces and retyping:
+    - Tracks cumulative output text
+    - Compares new text with previous output to find common prefix
+    - Only deletes characters after the mismatch point
+    - Only types new/changed characters
 
     This provides quick feedback during continuous speech while ensuring final output has
-    proper punctuation/capitalization from full sentence context.
+    proper punctuation/capitalization from full sentence context, with efficient text updates.
     """
 
     def __init__(
@@ -1085,6 +1091,9 @@ class WhisperEngine(STTEngine):
 
         # Track position of last transcribed audio (for delta transcription)
         self.last_transcribed_index = 0
+
+        # Track cumulative text output (for diff-based updates like VOSK)
+        self.cumulative_output = ""
 
         # Silence detection state (two independent timers)
         self.short_silence_timer = 0.0  # For intermediate transcription
@@ -1399,15 +1408,18 @@ class WhisperEngine(STTEngine):
 
         return False  # Keep buffering
 
-    def get_transcription_result(self) -> "Optional[Tuple[str, bool, int]]":
+    def get_transcription_result(self) -> "Optional[Tuple[str, bool]]":
         """
         Check if a transcription result is ready and retrieve it.
 
+        Returns full cumulative text to be processed by handle_fn_wrapper(),
+        just like VOSK does. The main loop's handle_fn_wrapper() will handle
+        diff calculation after process_fn() is applied.
+
         Returns:
-            Tuple of (text, is_final, chars_to_delete) if result ready, None otherwise
-            - text: The transcribed text
+            Tuple of (text, is_final) if result ready, None otherwise
+            - text: The full cumulative transcription text
             - is_final: True if this is the final transcription (long pause)
-            - chars_to_delete: Number of characters to delete before outputting text
         """
         with self.result_lock:
             if self.pending_result is None:
@@ -1418,28 +1430,35 @@ class WhisperEngine(STTEngine):
             self.pending_result = None
             self.pending_result_is_final = False
 
+        # For intermediate results, append to cumulative output
+        # For final results, replace entire cumulative output (full re-transcription)
         if is_final:
-            # Calculate total characters to delete (all intermediate outputs)
-            chars_to_delete = sum(len(s) for s in self.intermediate_outputs)
+            # Final result: this is a complete re-transcription of the full buffer
+            self.cumulative_output = result
+        else:
+            # Intermediate result: append delta to cumulative output
+            self.cumulative_output = self.cumulative_output + result
 
-            # Clear state for next utterance
+        if self.verbose >= 1:
+            result_type = "Final" if is_final else "Intermediate"
+            sys.stderr.write(
+                "{} result ready: {} chars total\n".format(
+                    result_type, len(self.cumulative_output)
+                )
+            )
+
+        # If this is a final result, clear state for next utterance
+        if is_final:
             self.audio_buffer.clear()
             self.last_transcribed_index = 0
             self.intermediate_outputs.clear()
             self.has_speech = False
+            # Return the text, then clear cumulative for next utterance
+            final_text = self.cumulative_output
+            self.cumulative_output = ""
+            return (final_text, True)
 
-            if self.verbose >= 1:
-                sys.stderr.write("Final result ready, clearing {} chars\n".format(chars_to_delete))
-
-            return (result, True, chars_to_delete)
-        else:
-            # Intermediate result: append to output list
-            self.intermediate_outputs.append(result)
-
-            if self.verbose >= 1:
-                sys.stderr.write("Intermediate result ready\n")
-
-            return (result, False, 0)
+        return (self.cumulative_output, False)
 
     def get_partial_result(self) -> str:
         """
@@ -1452,6 +1471,10 @@ class WhisperEngine(STTEngine):
         """
         Get final transcription result.
         This is called when recording ends manually (before finalization timer).
+
+        Note: This returns raw text, not diff-based updates. The caller in
+        text_from_stt_engine will handle this through handle_fn_wrapper which
+        applies its own diff logic in progressive mode.
         """
         # If there's any audio left in the buffer, transcribe it
         if self.audio_buffer:
@@ -1474,6 +1497,11 @@ class WhisperEngine(STTEngine):
                 if self.pending_result is not None:
                     result = self.pending_result
                     self.pending_result = None
+                    # Clear state
+                    self.audio_buffer.clear()
+                    self.last_transcribed_index = 0
+                    self.intermediate_outputs.clear()
+                    self.cumulative_output = ""
                     return result
 
             # Otherwise transcribe remaining buffer directly
@@ -1481,6 +1509,7 @@ class WhisperEngine(STTEngine):
             self.audio_buffer.clear()
             self.last_transcribed_index = 0
             self.intermediate_outputs.clear()
+            self.cumulative_output = ""
             return result
 
         return ""
@@ -1493,6 +1522,7 @@ class WhisperEngine(STTEngine):
         self.long_silence_timer = 0.0
         self.has_speech = False
         self.intermediate_outputs.clear()
+        self.cumulative_output = ""
 
         with self.result_lock:
             self.pending_result = None
@@ -1849,22 +1879,16 @@ def text_from_stt_engine(
         if isinstance(stt_engine, WhisperEngine):
             whisper_result = stt_engine.get_transcription_result()
             if whisper_result is not None:
-                text, is_final_result, chars_to_delete = whisper_result
+                text, is_final_result = whisper_result
 
-                if chars_to_delete > 0:
-                    # Final result: delete all intermediate outputs and replace
-                    processed_text = process_fn(text)
-                    handle_fn(chars_to_delete, processed_text)
-                    handled_any = True
-                else:
-                    # Intermediate result: append
-                    processed_text = process_fn(text)
-                    handle_fn(0, processed_text)
-                    handled_any = True
+                # Use handle_fn_wrapper() just like VOSK does
+                # is_partial=True for intermediate results, False for final results
+                handle_fn_wrapper(text, not is_final_result)
+                handled_any = True
 
-                # Update timeout tracking
-                if use_timeout and processed_text:
-                    timeout_text_prev = processed_text
+                # Update timeout tracking with the text (before process_fn)
+                if use_timeout and text:
+                    timeout_text_prev = text
                     timeout_time_prev = time.time()
 
     # Close the recording process.
