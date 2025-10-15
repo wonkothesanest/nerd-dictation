@@ -6,7 +6,13 @@ Tests that the engine can be instantiated and initialized without errors.
 
 import sys
 import os
-import numpy as np
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    print("Warning: numpy not available, some tests will be skipped")
 
 # Add current directory to path to import from nerd-dictation
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +40,8 @@ def test_whisper_engine_instantiation():
         whisper_temperature=0.0,
         whisper_initial_prompt="Test prompt",
         whisper_compute_type="float32",
+        whisper_silence_duration=0.5,
+        whisper_silence_finalize=2.0,
         verbose=0
     )
 
@@ -43,8 +51,10 @@ def test_whisper_engine_instantiation():
     assert engine.whisper_temperature == 0.0
     assert engine.whisper_initial_prompt == "Test prompt"
     assert engine.audio_buffer == []
-    assert engine.final_text == ""
+    assert engine.last_transcribed_index == 0
     assert engine.model is None  # Not initialized yet
+    assert engine.short_silence_timer == 0.0
+    assert engine.long_silence_timer == 0.0
 
     print("  ✓ WhisperEngine instantiation successful")
 
@@ -60,6 +70,8 @@ def test_whisper_engine_initialization():
         whisper_temperature=0.0,
         whisper_initial_prompt=None,
         whisper_compute_type="float32",
+        whisper_silence_duration=0.5,
+        whisper_silence_finalize=2.0,
         verbose=0
     )
 
@@ -67,7 +79,11 @@ def test_whisper_engine_initialization():
     try:
         engine.initialize()
         assert engine.model is not None
+        assert engine.worker_thread is not None
+        assert engine.worker_thread.is_alive()
         print("  ✓ WhisperEngine initialization successful")
+        print("  ✓ Worker thread started")
+        engine.shutdown()  # Clean up
         return True
     except Exception as e:
         print(f"  ⚠ WhisperEngine initialization failed (this is expected if no internet): {e}")
@@ -77,10 +93,16 @@ def test_whisper_engine_audio_buffering():
     """Test that WhisperEngine can buffer audio chunks."""
     print("\nTest 3: WhisperEngine audio buffering...")
 
+    if not HAS_NUMPY:
+        print("  ⚠ Skipping (numpy not available)")
+        return
+
     engine = WhisperEngine(
         whisper_model="tiny",
         whisper_model_dir="/tmp/whisper-models",
         sample_rate=16000,
+        whisper_silence_duration=0.5,
+        whisper_silence_finalize=2.0,
         verbose=0
     )
 
@@ -90,7 +112,7 @@ def test_whisper_engine_audio_buffering():
     # Process audio chunk
     result = engine.process_audio_chunk(fake_audio)
 
-    assert result == False  # Whisper doesn't support partial results
+    assert result == False  # Should return False (not finalized yet)
     assert len(engine.audio_buffer) == 1
     assert engine.audio_buffer[0] == fake_audio
 
@@ -108,6 +130,8 @@ def test_whisper_engine_interface():
         whisper_model="tiny",
         whisper_model_dir="/tmp/whisper-models",
         sample_rate=16000,
+        whisper_silence_duration=0.5,
+        whisper_silence_finalize=2.0,
         verbose=0
     )
 
@@ -119,13 +143,18 @@ def test_whisper_engine_interface():
     assert hasattr(engine, 'reset')
     assert hasattr(engine, 'supports_progressive')
 
-    # Check that supports_progressive returns False for Whisper
-    assert engine.supports_progressive() == False
+    # Check that supports_progressive now returns True (threading support)
+    assert engine.supports_progressive() == True
 
     # Check that get_partial_result returns empty string
     assert engine.get_partial_result() == ""
 
+    # Check for new threading methods
+    assert hasattr(engine, 'get_transcription_result')
+    assert hasattr(engine, 'shutdown')
+
     print("  ✓ STTEngine interface compliance verified")
+    print("  ✓ Threading methods present")
 
 def test_abstract_base_class():
     """Test that STTEngine is properly defined as an abstract base."""

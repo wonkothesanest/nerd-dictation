@@ -1,0 +1,86 @@
+WHISPER THREADING FLOW DIAGRAM
+===============================
+
+MAIN THREAD                          WORKER THREAD                    OUTPUT
+-----------                          -------------                    ------
+
+[Speak: "sentence one"]
+  ↓
+Audio chunks → buffer
+  ↓
+Silence detected (0.5s)
+  ↓
+Queue task: delta[0:100]
+  ↓                                  Dequeue task
+Continue buffering                   ↓
+  ↓                                  Transcribe delta → "Sentence one"
+  ↓                                  ↓
+[Speak: "sentence two"]              Store result
+  ↓                                  ↓
+Check for result ←-------------------┘                                → "Sentence one"
+  ↓
+Audio chunks → buffer
+  ↓
+Silence detected (0.5s)
+  ↓
+Queue task: delta[100:200]
+  ↓                                  Dequeue task
+Continue buffering                   ↓
+  ↓                                  Transcribe delta → "Sentence two"
+  ↓                                  ↓
+[Speak: "sentence three"]            Store result
+  ↓                                  ↓
+Check for result ←-------------------┘                                → " Sentence two"
+  ↓
+Audio chunks → buffer
+  ↓
+Silence detected (0.5s)
+  ↓
+Queue task: delta[200:300]
+  ↓                                  Dequeue task
+Continue buffering                   ↓
+  ↓                                  Transcribe delta → "Sentence three"
+Long silence (2.0s)                  ↓
+  ↓                                  Store result
+Check for result ←-------------------┘                                → " Sentence three"
+  ↓
+Queue task: FULL[0:300]
+  ↓                                  Dequeue task
+Continue buffering                   ↓
+  ↓                                  Transcribe full → "Sentence one. Sentence two. Sentence three."
+  ↓                                  ↓
+  ↓                                  Store result (is_final=True)
+  ↓                                  ↓
+Check for result ←-------------------┘                                [Delete 45 chars]
+  ↓                                                                    → "Sentence one. Sentence two. Sentence three."
+Clear buffer, ready for next
+  ↓
+[Speak: "sentence four"]
+...
+
+
+KEY OBSERVATIONS:
+=================
+
+1. MAIN THREAD NEVER BLOCKS
+   - Always reading audio from subprocess
+   - Always detecting silence
+   - Always checking for results
+
+2. TRANSCRIPTIONS HAPPEN IN BACKGROUND
+   - User can keep speaking
+   - Queue accumulates tasks if needed
+   - Coalescing prevents backlog
+
+3. TWO TYPES OF TRANSCRIPTIONS
+   - Delta (new audio only): Fast, intermediate feedback
+   - Full (entire buffer): Slow, high quality, context-aware
+
+4. OUTPUT PROGRESSION
+   - Intermediate outputs append (no deletion)
+   - Final output replaces all (deletes intermediate chars)
+
+5. BUFFER LIFECYCLE
+   - Grows during speech
+   - Preserved through intermediate transcriptions
+   - Cleared only after final (2.0s) transcription

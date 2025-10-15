@@ -1041,8 +1041,13 @@ class WhisperEngine(STTEngine):
     """
     Whisper speech recognition engine implementation using faster-whisper.
 
-    Unlike VOSK, Whisper processes complete audio files rather than streaming chunks.
-    This means it only supports deferred output mode (no progressive typing).
+    Uses a two-tier silence detection system with background transcription:
+    - Short pause (whisper_silence_duration, default 0.5s): Transcribe new audio since last pause, append output
+    - Long pause (whisper_silence_finalize, default 2.0s): Re-transcribe entire buffer with full context,
+      replace all previous output with properly formatted result, then clear buffer
+
+    This provides quick feedback during continuous speech while ensuring final output has
+    proper punctuation/capitalization from full sentence context.
     """
 
     def __init__(
@@ -1056,6 +1061,7 @@ class WhisperEngine(STTEngine):
         whisper_initial_prompt: Optional[str] = None,
         whisper_compute_type: str = "float16",
         whisper_silence_duration: float = 0.5,
+        whisper_silence_finalize: float = 2.0,
         whisper_silence_threshold: float = 0.01,
         verbose: int = 0,
     ):
@@ -1067,24 +1073,40 @@ class WhisperEngine(STTEngine):
         self.whisper_initial_prompt = whisper_initial_prompt
         self.whisper_compute_type = whisper_compute_type
         self.whisper_silence_duration = whisper_silence_duration
+        self.whisper_silence_finalize = whisper_silence_finalize
         self.whisper_silence_threshold = whisper_silence_threshold
         self.verbose = verbose
 
         # Will be initialized in initialize()
         self.model: "Optional[Any]" = None
 
-        # Audio buffer for accumulating chunks
+        # Audio buffer for accumulating chunks (cumulative until finalization)
         self.audio_buffer: List[bytes] = []
 
-        # Final transcription result
-        self.final_text = ""
+        # Track position of last transcribed audio (for delta transcription)
+        self.last_transcribed_index = 0
 
-        # Silence detection state
-        self.silence_duration_accumulated = 0.0
+        # Silence detection state (two independent timers)
+        self.short_silence_timer = 0.0  # For intermediate transcription
+        self.long_silence_timer = 0.0   # For finalization
         self.has_speech = False  # Track if we've seen any speech in current buffer
 
+        # Threading state
+        import threading
+        import queue
+        self.transcription_thread: "Optional[threading.Thread]" = None
+        self.transcription_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self.worker_thread: "Optional[threading.Thread]" = None
+        self.worker_shutdown = False
+        self.result_lock = threading.Lock()
+
+        # Results tracking
+        self.pending_result: Optional[str] = None
+        self.pending_result_is_final = False
+        self.intermediate_outputs: List[str] = []  # Track outputs for final erase
+
     def initialize(self) -> None:
-        """Initialize Whisper model."""
+        """Initialize Whisper model and start worker thread."""
         from faster_whisper import WhisperModel
 
         if self.verbose >= 1:
@@ -1125,6 +1147,12 @@ class WhisperEngine(STTEngine):
         if self.verbose >= 1:
             sys.stderr.write("Whisper model loaded (compute type: {}).\n".format(compute_type))
 
+        # Start worker thread for background transcription
+        import threading
+        self.worker_shutdown = False
+        self.worker_thread = threading.Thread(target=self._transcription_worker, daemon=True)
+        self.worker_thread.start()
+
     def _is_silence(self, audio_chunk: bytes) -> bool:
         """
         Detect if an audio chunk contains silence based on RMS energy.
@@ -1163,18 +1191,24 @@ class WhisperEngine(STTEngine):
 
         return is_silent
 
-    def _transcribe_buffer(self) -> str:
+    def _transcribe_audio_chunk(self, audio_chunk_list: List[bytes]) -> str:
         """
-        Transcribe the current audio buffer and return the result.
-        This is a helper method used by both silence detection and final result.
+        Transcribe a list of audio chunks and return the result.
+        This is a helper method that performs the actual Whisper transcription.
+
+        Args:
+            audio_chunk_list: List of audio byte chunks to transcribe
+
+        Returns:
+            Transcribed text
         """
-        if not self.audio_buffer:
+        if not audio_chunk_list:
             return ""
 
         import numpy as np
 
         # Combine all audio chunks
-        audio_data = b"".join(self.audio_buffer)
+        audio_data = b"".join(audio_chunk_list)
 
         # Convert bytes to numpy array (s16le format = signed 16-bit little-endian)
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
@@ -1231,12 +1265,72 @@ class WhisperEngine(STTEngine):
             sys.stderr.write("Whisper transcription error: {!s}\n".format(ex))
             return ""
 
+    def _transcription_worker(self) -> None:
+        """
+        Worker thread that processes transcription tasks from the queue.
+        Implements queue coalescing to skip obsolete intermediate transcriptions.
+        """
+        import queue as queue_module
+
+        while not self.worker_shutdown:
+            try:
+                # Wait for a task (blocking, with timeout for shutdown check)
+                task = self.transcription_queue.get(timeout=0.1)
+
+                if task is None:  # Shutdown signal
+                    break
+
+                # Queue coalescing: if multiple tasks are pending, skip to the latest
+                # This prevents transcribing stale audio when user speaks faster than transcription
+                while not self.transcription_queue.empty():
+                    try:
+                        next_task = self.transcription_queue.get_nowait()
+                        if next_task is None:
+                            break
+                        # Skip current task, use the newer one
+                        task = next_task
+                        if self.verbose >= 1:
+                            sys.stderr.write("Queue coalescing: skipping obsolete transcription\n")
+                    except queue_module.Empty:
+                        break
+
+                # Process the task
+                audio_to_transcribe = task["audio"]
+                is_final = task["is_final"]
+
+                if self.verbose >= 1:
+                    task_type = "final" if is_final else "intermediate"
+                    sys.stderr.write("Worker: starting {} transcription\n".format(task_type))
+
+                # Perform transcription
+                result = self._transcribe_audio_chunk(audio_to_transcribe)
+
+                # Store result for main thread to retrieve
+                with self.result_lock:
+                    self.pending_result = result
+                    self.pending_result_is_final = is_final
+
+                if self.verbose >= 1:
+                    sys.stderr.write("Worker: transcription ready\n")
+
+            except queue_module.Empty:
+                # Timeout, check shutdown flag and continue
+                continue
+            except Exception as ex:
+                sys.stderr.write("Worker thread error: {!s}\n".format(ex))
+                import traceback
+                traceback.print_exc()
+
     def process_audio_chunk(self, data: bytes) -> bool:
         """
         Buffer audio chunk and detect silence to trigger automatic transcription.
 
+        Uses two-tier silence detection:
+        - Short pause (whisper_silence_duration): Transcribe delta (new audio since last transcription)
+        - Long pause (whisper_silence_finalize): Re-transcribe full buffer and finalize
+
         Returns:
-            True if silence detected and transcription triggered, False otherwise
+            True if finalization triggered (long pause), False otherwise
         """
         # Always buffer the audio data
         self.audio_buffer.append(data)
@@ -1245,9 +1339,10 @@ class WhisperEngine(STTEngine):
         is_silent = self._is_silence(data)
 
         if not is_silent:
-            # We have speech, reset silence accumulator
+            # We have speech, reset both silence timers
             self.has_speech = True
-            self.silence_duration_accumulated = 0.0
+            self.short_silence_timer = 0.0
+            self.long_silence_timer = 0.0
             return False
 
         # If we've never seen speech in this buffer, don't trigger transcription
@@ -1258,50 +1353,164 @@ class WhisperEngine(STTEngine):
         # Accumulate silence duration
         # Estimate chunk duration: len(data) bytes / 2 bytes per sample / sample_rate
         chunk_duration = (len(data) / 2) / self.sample_rate
-        self.silence_duration_accumulated += chunk_duration
+        self.short_silence_timer += chunk_duration
+        self.long_silence_timer += chunk_duration
 
-        # If we've accumulated enough silence, trigger transcription
-        if self.silence_duration_accumulated >= self.whisper_silence_duration:
-            # Transcribe the accumulated audio
-            self.final_text = self._transcribe_buffer()
+        # Check for short pause (intermediate transcription)
+        if self.short_silence_timer >= self.whisper_silence_duration:
+            # Only trigger if not already transcribing and we have new audio
+            if self.transcription_queue.empty() and self.last_transcribed_index < len(self.audio_buffer):
+                # Transcribe only NEW audio since last transcription (delta)
+                audio_to_transcribe = self.audio_buffer[self.last_transcribed_index:]
 
-            # Reset for next utterance
-            self.audio_buffer.clear()
-            self.silence_duration_accumulated = 0.0
-            self.has_speech = False
+                if self.verbose >= 1:
+                    sys.stderr.write("Short pause detected, queueing delta transcription\n")
 
-            return True  # Signal that we have a final result
+                # Queue the transcription task
+                self.transcription_queue.put({
+                    "audio": audio_to_transcribe,
+                    "is_final": False,
+                })
+
+                # Update last transcribed position
+                self.last_transcribed_index = len(self.audio_buffer)
+
+            # Reset short timer (don't trigger again until more speech)
+            self.short_silence_timer = 0.0
+
+        # Check for long pause (finalization)
+        if self.long_silence_timer >= self.whisper_silence_finalize:
+            # Only trigger if not already transcribing
+            if self.transcription_queue.empty():
+                if self.verbose >= 1:
+                    sys.stderr.write("Long pause detected, queueing full transcription\n")
+
+                # Re-transcribe ENTIRE buffer for best quality
+                self.transcription_queue.put({
+                    "audio": self.audio_buffer[:],  # Full buffer copy
+                    "is_final": True,
+                })
+
+            # Reset timers (don't trigger again)
+            self.short_silence_timer = 0.0
+            self.long_silence_timer = 0.0
+
+            return True  # Signal finalization
 
         return False  # Keep buffering
 
+    def get_transcription_result(self) -> "Optional[Tuple[str, bool, int]]":
+        """
+        Check if a transcription result is ready and retrieve it.
+
+        Returns:
+            Tuple of (text, is_final, chars_to_delete) if result ready, None otherwise
+            - text: The transcribed text
+            - is_final: True if this is the final transcription (long pause)
+            - chars_to_delete: Number of characters to delete before outputting text
+        """
+        with self.result_lock:
+            if self.pending_result is None:
+                return None
+
+            result = self.pending_result
+            is_final = self.pending_result_is_final
+            self.pending_result = None
+            self.pending_result_is_final = False
+
+        if is_final:
+            # Calculate total characters to delete (all intermediate outputs)
+            chars_to_delete = sum(len(s) for s in self.intermediate_outputs)
+
+            # Clear state for next utterance
+            self.audio_buffer.clear()
+            self.last_transcribed_index = 0
+            self.intermediate_outputs.clear()
+            self.has_speech = False
+
+            if self.verbose >= 1:
+                sys.stderr.write("Final result ready, clearing {} chars\n".format(chars_to_delete))
+
+            return (result, True, chars_to_delete)
+        else:
+            # Intermediate result: append to output list
+            self.intermediate_outputs.append(result)
+
+            if self.verbose >= 1:
+                sys.stderr.write("Intermediate result ready\n")
+
+            return (result, False, 0)
+
     def get_partial_result(self) -> str:
-        """Whisper doesn't support partial results."""
+        """
+        Check for completed transcription results.
+        Returns empty string (Whisper provides results via get_transcription_result).
+        """
         return ""
 
     def get_final_result(self) -> str:
         """
         Get final transcription result.
-        This is called when recording ends.
+        This is called when recording ends manually (before finalization timer).
         """
-        # If we've already transcribed via silence detection, return the cached result
-        if self.final_text:
-            result = self.final_text
-            self.final_text = ""  # Clear for next use
+        # If there's any audio left in the buffer, transcribe it
+        if self.audio_buffer:
+            if self.verbose >= 1:
+                sys.stderr.write("Manual end: transcribing remaining buffer\n")
+
+            # Wait for any pending transcription to finish
+            if self.worker_thread and self.worker_thread.is_alive():
+                import time
+                timeout = 10.0
+                start_time = time.time()
+                while not self.transcription_queue.empty():
+                    if time.time() - start_time > timeout:
+                        sys.stderr.write("Warning: transcription queue timeout\n")
+                        break
+                    time.sleep(0.1)
+
+            # Check if there's a pending result
+            with self.result_lock:
+                if self.pending_result is not None:
+                    result = self.pending_result
+                    self.pending_result = None
+                    return result
+
+            # Otherwise transcribe remaining buffer directly
+            result = self._transcribe_audio_chunk(self.audio_buffer)
+            self.audio_buffer.clear()
+            self.last_transcribed_index = 0
+            self.intermediate_outputs.clear()
             return result
 
-        # Otherwise, transcribe whatever is in the buffer
-        return self._transcribe_buffer()
+        return ""
 
     def reset(self) -> None:
         """Clear audio buffer and silence detection state."""
         self.audio_buffer.clear()
-        self.final_text = ""
-        self.silence_duration_accumulated = 0.0
+        self.last_transcribed_index = 0
+        self.short_silence_timer = 0.0
+        self.long_silence_timer = 0.0
         self.has_speech = False
+        self.intermediate_outputs.clear()
+
+        with self.result_lock:
+            self.pending_result = None
+            self.pending_result_is_final = False
+
+    def shutdown(self) -> None:
+        """Shutdown the worker thread."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_shutdown = True
+            self.transcription_queue.put(None)  # Shutdown signal
+            self.worker_thread.join(timeout=2.0)
 
     def supports_progressive(self) -> bool:
-        """Whisper does not support progressive/streaming recognition."""
-        return False
+        """
+        Whisper now supports a form of progressive output via threaded transcription.
+        Intermediate results are appended, final result replaces all.
+        """
+        return True
 
 
 # -----------------------------------------------------------------------------
@@ -1636,6 +1845,28 @@ def text_from_stt_engine(
                     if code == 0:
                         code = 1  # The time was exceeded, exit!
 
+        # Check for completed Whisper transcription results (if using WhisperEngine)
+        if isinstance(stt_engine, WhisperEngine):
+            whisper_result = stt_engine.get_transcription_result()
+            if whisper_result is not None:
+                text, is_final_result, chars_to_delete = whisper_result
+
+                if chars_to_delete > 0:
+                    # Final result: delete all intermediate outputs and replace
+                    processed_text = process_fn(text)
+                    handle_fn(chars_to_delete, processed_text)
+                    handled_any = True
+                else:
+                    # Intermediate result: append
+                    processed_text = process_fn(text)
+                    handle_fn(0, processed_text)
+                    handled_any = True
+
+                # Update timeout tracking
+                if use_timeout and processed_text:
+                    timeout_text_prev = processed_text
+                    timeout_time_prev = time.time()
+
     # Close the recording process.
     if has_ps:
         # stdout.close(), no need, this is exiting.
@@ -1656,6 +1887,10 @@ def text_from_stt_engine(
     if not progressive:
         # We never arrive here needing deletions
         handle_fn(0, process_fn(" ".join(text_list)))
+
+    # Cleanup: shutdown worker thread if using WhisperEngine
+    if isinstance(stt_engine, WhisperEngine):
+        stt_engine.shutdown()
 
     return handled_any
 
@@ -1739,6 +1974,7 @@ def main_begin(
     whisper_initial_prompt: Optional[str] = None,
     whisper_compute_type: str = "float16",
     whisper_silence_duration: float = 0.5,
+    whisper_silence_finalize: float = 2.0,
     whisper_silence_threshold: float = 0.01,
 ) -> None:
     """
@@ -1916,16 +2152,12 @@ def main_begin(
             whisper_initial_prompt=whisper_initial_prompt,
             whisper_compute_type=whisper_compute_type,
             whisper_silence_duration=whisper_silence_duration,
+            whisper_silence_finalize=whisper_silence_finalize,
             whisper_silence_threshold=whisper_silence_threshold,
             verbose=verbose,
         )
-        # Whisper doesn't support progressive mode, force deferred output
-        if progressive:
-            sys.stderr.write(
-                "Warning: Whisper engine does not support progressive output. "
-                "Using deferred output mode instead.\n"
-            )
-            progressive = False
+        # Whisper now supports progressive-like output via threading
+        # Keep progressive mode enabled for proper output handling
     else:
         sys.stderr.write("Unknown STT engine: {!r}\n".format(stt_engine))
         sys.exit(1)
@@ -2173,9 +2405,25 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
         type=float,
         metavar="SECONDS",
         help=(
-            "Duration of silence in seconds to trigger transcription (default: 0.5).\n"
-            "When this much continuous silence is detected after speech, Whisper will transcribe the utterance.\n"
+            "Duration of silence in seconds to trigger intermediate transcription (default: 0.5).\n"
+            "When this much continuous silence is detected after speech, Whisper will transcribe\n"
+            "new audio since the last pause and append it to the output.\n"
             "Lower values = more responsive but may cut off speech. Higher values = more patient."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-silence-finalize",
+        default=2.0,
+        dest="whisper_silence_finalize",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Duration of silence in seconds to finalize and re-transcribe entire buffer (default: 2.0).\n"
+            "After this much silence, Whisper re-transcribes all accumulated audio with full context\n"
+            "for better punctuation/capitalization, then replaces the intermediate outputs.\n"
+            "This should be longer than --whisper-silence-duration."
         ),
         required=False,
     )
