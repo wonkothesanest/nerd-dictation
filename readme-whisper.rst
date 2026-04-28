@@ -149,9 +149,11 @@ Advanced Whisper Options
    **Note:** The system automatically falls back to ``int8`` if ``float16`` is not supported.
 
 ``--whisper-silence-duration SECONDS``
-   Duration of continuous silence (in seconds) to trigger transcription. Default: ``0.5``
+   Duration of continuous silence (in seconds) to trigger an intermediate transcription. Default: ``0.5``
 
-   When this much silence is detected after speech, Whisper transcribes the utterance.
+   When this much silence is detected after speech, Whisper transcribes the new audio
+   since the last pause and appends it to the output. This keeps Whisper responsive
+   during continuous dictation.
 
    - Lower values (``0.3``) = More responsive, may cut off speech
    - Higher values (``1.0``) = More patient, waits longer for pauses
@@ -161,6 +163,27 @@ Advanced Whisper Options
    .. code-block:: sh
 
       nerd-dictation begin --stt-engine WHISPER --whisper-silence-duration 1.0
+
+``--whisper-silence-finalize SECONDS``
+   Duration of continuous silence (in seconds) to finalize the utterance. Default: ``2.0``
+
+   When this longer pause is reached, Whisper re-transcribes the full buffered
+   utterance with complete context, replaces the intermediate text, and clears the
+   buffer for the next utterance. This is the guard that prevents short pauses from
+   being treated as the final sentence boundary.
+
+   Keep this value longer than ``--whisper-silence-duration``.
+
+   - Lower values (``1.0``) = Faster final punctuation, may finalize during thinking pauses
+   - Higher values (``3.0``) = More tolerant of pauses, delays final punctuation and buffer reset
+
+   Example:
+
+   .. code-block:: sh
+
+      nerd-dictation begin --stt-engine WHISPER \
+          --whisper-silence-duration 0.7 \
+          --whisper-silence-finalize 3.0
 
 ``--whisper-silence-threshold FLOAT``
    RMS energy threshold for silence detection (0.0 to 1.0). Default: ``0.01``
@@ -189,6 +212,46 @@ Advanced Whisper Options
 
    - Lower values (``0.4``) = More aggressive suppression
    - Higher values (``0.8``) = Less aggressive suppression
+
+Tuning the Silence Guard
+------------------------
+
+Whisper uses two silence timers:
+
+1. ``--whisper-silence-duration`` controls intermediate output after a short pause.
+2. ``--whisper-silence-finalize`` controls when the buffered utterance is finalized,
+   re-transcribed with full context, and cleared.
+
+Start by changing one option at a time:
+
+- If text appears too late, lower ``--whisper-silence-duration``.
+- If words are cut off or split awkwardly, raise ``--whisper-silence-duration``.
+- If final punctuation appears while you are still thinking, raise ``--whisper-silence-finalize``.
+- If final punctuation takes too long after you stop, lower ``--whisper-silence-finalize``.
+- If quiet speech is missed, lower ``--whisper-silence-threshold``.
+- If room noise triggers transcription or hallucinations, raise ``--whisper-silence-threshold``.
+
+Recommended starting points:
+
+.. code-block:: sh
+
+   # Quiet room, responsive dictation
+   nerd-dictation begin --stt-engine WHISPER \
+       --whisper-silence-duration 0.5 \
+       --whisper-silence-finalize 2.0 \
+       --whisper-silence-threshold 0.01
+
+   # Noisy room or microphone hiss
+   nerd-dictation begin --stt-engine WHISPER \
+       --whisper-silence-duration 0.8 \
+       --whisper-silence-finalize 3.0 \
+       --whisper-silence-threshold 0.02
+
+   # Quiet speaker or low microphone gain
+   nerd-dictation begin --stt-engine WHISPER \
+       --whisper-silence-duration 0.8 \
+       --whisper-silence-finalize 2.5 \
+       --whisper-silence-threshold 0.005
 
 
 Usage Examples
@@ -365,7 +428,16 @@ Whisper hallucinations (repeating text)
       nerd-dictation begin --stt-engine WHISPER \
           --whisper-no-speech-threshold 0.4
 
-4. Use ``--verbose 2`` to see audio energy levels:
+4. Increase the silence guard if short pauses are being finalized too quickly:
+
+   .. code-block:: sh
+
+      nerd-dictation begin --stt-engine WHISPER \
+          --whisper-silence-duration 0.8 \
+          --whisper-silence-finalize 3.0 \
+          --whisper-silence-threshold 0.02
+
+5. Use ``--verbose 2`` to see audio energy levels:
 
    .. code-block:: sh
 
@@ -545,8 +617,8 @@ Processing Flow
 2. Whisper model loads in parallel
 3. Audio chunks buffered in memory
 4. Silence detection monitors RMS energy levels
-5. After configured silence duration, transcription triggered
-6. Whisper transcribes buffered audio
+5. A short pause triggers intermediate transcription for new audio
+6. A longer pause finalizes the utterance with full-context re-transcription
 7. Text processed (user config, number parsing, etc.)
 8. Output simulated as keystrokes or printed to stdout
 

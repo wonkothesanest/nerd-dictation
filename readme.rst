@@ -97,7 +97,7 @@ Whisper (Optional)
 - Automatic punctuation and capitalization
 - Multi-language support with better quality
 - Larger memory footprint
-- Deferred output only (types all text at once)
+- Silence-triggered output with final full-context cleanup
 
 **Installation:**
 
