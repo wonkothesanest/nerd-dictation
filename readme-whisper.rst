@@ -180,6 +180,16 @@ Advanced Whisper Options
       # Less sensitive (for noisy environment)
       nerd-dictation begin --stt-engine WHISPER --whisper-silence-threshold 0.02
 
+``--whisper-no-speech-threshold FLOAT``
+   Whisper no-speech probability threshold for dropping silent hallucination segments.
+   Default: ``0.6``
+
+   Whisper can sometimes emit text for silence or very quiet non-speech audio. Segments
+   with a no-speech probability at or above this threshold are suppressed.
+
+   - Lower values (``0.4``) = More aggressive suppression
+   - Higher values (``0.8``) = Less aggressive suppression
+
 
 Usage Examples
 ==============
@@ -348,7 +358,14 @@ Whisper hallucinations (repeating text)
       nerd-dictation begin --stt-engine WHISPER \
           --whisper-silence-threshold 0.02
 
-3. Use ``--verbose 2`` to see audio energy levels:
+3. Lower the no-speech threshold to suppress more suspected silent hallucinations:
+
+   .. code-block:: sh
+
+      nerd-dictation begin --stt-engine WHISPER \
+          --whisper-no-speech-threshold 0.4
+
+4. Use ``--verbose 2`` to see audio energy levels:
 
    .. code-block:: sh
 

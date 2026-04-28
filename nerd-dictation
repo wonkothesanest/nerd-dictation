@@ -20,6 +20,7 @@ import time
 # Types.
 from typing import (
     Any,
+    Iterable,
     Dict,
     IO,
     List,
@@ -1069,6 +1070,7 @@ class WhisperEngine(STTEngine):
         whisper_silence_duration: float = 0.5,
         whisper_silence_finalize: float = 2.0,
         whisper_silence_threshold: float = 0.01,
+        whisper_no_speech_threshold: float = 0.6,
         verbose: int = 0,
     ):
         self.whisper_model = whisper_model
@@ -1081,6 +1083,7 @@ class WhisperEngine(STTEngine):
         self.whisper_silence_duration = whisper_silence_duration
         self.whisper_silence_finalize = whisper_silence_finalize
         self.whisper_silence_threshold = whisper_silence_threshold
+        self.whisper_no_speech_threshold = whisper_no_speech_threshold
         self.verbose = verbose
 
         # Will be initialized in initialize()
@@ -1200,6 +1203,36 @@ class WhisperEngine(STTEngine):
 
         return is_silent
 
+    def _segments_to_text(self, segments: "Iterable[Any]") -> str:
+        """Collect Whisper segments, dropping segments classified as no-speech."""
+        text_parts = []
+        skipped_segments = 0
+
+        for segment in segments:
+            no_speech_prob = getattr(segment, "no_speech_prob", None)
+            if (
+                no_speech_prob is not None
+                and no_speech_prob >= self.whisper_no_speech_threshold
+            ):
+                skipped_segments += 1
+                if self.verbose >= 1:
+                    sys.stderr.write(
+                        "Skipping Whisper no-speech segment "
+                        "(probability: {:.3f}, threshold: {:.3f})\n".format(
+                            no_speech_prob, self.whisper_no_speech_threshold
+                        )
+                    )
+                continue
+
+            text_parts.append(segment.text)
+
+        result = "".join(text_parts).strip()
+
+        if self.verbose >= 1 and skipped_segments and not result:
+            sys.stderr.write("Whisper no-speech gate suppressed transcription.\n")
+
+        return result
+
     def _transcribe_audio_chunk(self, audio_chunk_list: List[bytes]) -> str:
         """
         Transcribe a list of audio chunks and return the result.
@@ -1247,6 +1280,7 @@ class WhisperEngine(STTEngine):
             "language": self.whisper_language,
             "temperature": self.whisper_temperature,
             "initial_prompt": self.whisper_initial_prompt,
+            "no_speech_threshold": self.whisper_no_speech_threshold,
         }
 
         # Remove None values
@@ -1258,12 +1292,7 @@ class WhisperEngine(STTEngine):
                 **transcribe_options
             )
 
-            # Collect all segments into final text
-            text_parts = []
-            for segment in segments:
-                text_parts.append(segment.text)
-
-            result = "".join(text_parts).strip()
+            result = self._segments_to_text(segments)
 
             if self.verbose >= 1:
                 sys.stderr.write("Transcription complete: {!r}\n".format(result))
@@ -1478,6 +1507,15 @@ class WhisperEngine(STTEngine):
         """
         # If there's any audio left in the buffer, transcribe it
         if self.audio_buffer:
+            if not self.has_speech:
+                if self.verbose >= 1:
+                    sys.stderr.write("Manual end: no speech detected, skipping Whisper transcription\n")
+                self.audio_buffer.clear()
+                self.last_transcribed_index = 0
+                self.intermediate_outputs.clear()
+                self.cumulative_output = ""
+                return ""
+
             if self.verbose >= 1:
                 sys.stderr.write("Manual end: transcribing remaining buffer\n")
 
@@ -2000,6 +2038,7 @@ def main_begin(
     whisper_silence_duration: float = 0.5,
     whisper_silence_finalize: float = 2.0,
     whisper_silence_threshold: float = 0.01,
+    whisper_no_speech_threshold: float = 0.6,
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -2178,6 +2217,7 @@ def main_begin(
             whisper_silence_duration=whisper_silence_duration,
             whisper_silence_finalize=whisper_silence_finalize,
             whisper_silence_threshold=whisper_silence_threshold,
+            whisper_no_speech_threshold=whisper_no_speech_threshold,
             verbose=verbose,
         )
         # Whisper now supports progressive-like output via threading
@@ -2462,6 +2502,20 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             "RMS energy threshold for silence detection (default: 0.01, range: 0.0-1.0).\n"
             "Audio with energy below this threshold is considered silence.\n"
             "Lower values = more sensitive (detects quieter speech). Higher values = less sensitive."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-no-speech-threshold",
+        default=0.6,
+        dest="whisper_no_speech_threshold",
+        type=float,
+        metavar="FLOAT",
+        help=(
+            "Whisper no-speech probability threshold for dropping silent hallucination segments "
+            "(default: 0.6, range: 0.0-1.0).\n"
+            "Higher values are less aggressive; lower values suppress more suspected non-speech output."
         ),
         required=False,
     )
@@ -2753,7 +2807,9 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             whisper_initial_prompt=args.whisper_initial_prompt,
             whisper_compute_type=args.whisper_compute_type,
             whisper_silence_duration=args.whisper_silence_duration,
+            whisper_silence_finalize=args.whisper_silence_finalize,
             whisper_silence_threshold=args.whisper_silence_threshold,
+            whisper_no_speech_threshold=args.whisper_no_speech_threshold,
         ),
     )
 
