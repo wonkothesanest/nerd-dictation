@@ -148,9 +148,23 @@ def test_whisper_no_speech_gate():
     assert text == "real speech"
 
     text = engine._segments_to_text([
+        FakeSegment("kept speech", 0.59),
+        FakeSegment(" suppressed at threshold", 0.6),
+    ])
+    assert text == "kept speech"
+
+    text = engine._segments_to_text([
         FakeSegment("hallucinated silence", 0.95),
     ])
     assert text == ""
+
+    class SegmentWithoutNoSpeechProb:
+        text = "legacy segment"
+
+    text = engine._segments_to_text([
+        SegmentWithoutNoSpeechProb(),
+    ])
+    assert text == "legacy segment"
 
     engine.audio_buffer.append(b"\x00" * 3200)
 
@@ -163,9 +177,37 @@ def test_whisper_no_speech_gate():
 
     print("  ✓ No-speech gate suppresses silent/hallucinated output")
 
+def test_whisper_silence_only_audio_does_not_queue_transcription():
+    """Test that repeated silence before speech never queues Whisper work."""
+    print("\nTest 5: Whisper silence-only buffering...")
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        whisper_silence_duration=0.1,
+        whisper_silence_finalize=0.2,
+        verbose=0
+    )
+
+    engine._is_silence = lambda _data: True
+    silence_chunk = b"\x00" * 3200
+
+    for _ in range(4):
+        assert engine.process_audio_chunk(silence_chunk) == False
+
+    assert engine.has_speech == False
+    assert engine.short_silence_timer == 0.0
+    assert engine.long_silence_timer == 0.0
+    assert engine.last_transcribed_index == 0
+    assert engine.transcription_queue.empty()
+    assert len(engine.audio_buffer) == 4
+
+    print("  ✓ Silence-only audio does not queue transcription")
+
 def test_whisper_engine_interface():
     """Test that WhisperEngine implements the STTEngine interface."""
-    print("\nTest 5: STTEngine interface compliance...")
+    print("\nTest 6: STTEngine interface compliance...")
 
     engine = WhisperEngine(
         whisper_model="tiny",
@@ -199,7 +241,7 @@ def test_whisper_engine_interface():
 
 def test_abstract_base_class():
     """Test that STTEngine is properly defined as an abstract base."""
-    print("\nTest 6: STTEngine abstract base class...")
+    print("\nTest 7: STTEngine abstract base class...")
 
     # Try to call abstract methods (should raise NotImplementedError)
     engine = STTEngine()
@@ -228,6 +270,7 @@ def main():
         test_whisper_engine_instantiation()
         test_whisper_engine_audio_buffering()
         test_whisper_no_speech_gate()
+        test_whisper_silence_only_audio_does_not_queue_transcription()
         test_whisper_engine_interface()
         model_initialized = test_whisper_engine_initialization()
 
