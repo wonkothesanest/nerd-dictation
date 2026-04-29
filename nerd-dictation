@@ -1057,6 +1057,10 @@ class WhisperEngine(STTEngine):
     proper punctuation/capitalization from full sentence context, with efficient text updates.
     """
 
+    LOW_ENERGY_TEXT_RMS_MULTIPLIER = 1.5
+    LOW_ENERGY_TEXT_MIN_CHARS = 80
+    LOW_ENERGY_TEXT_MAX_CHARS_PER_SECOND = 25.0
+
     def __init__(
         self,
         *,
@@ -1203,6 +1207,102 @@ class WhisperEngine(STTEngine):
 
         return is_silent
 
+    def _audio_chunks_rms_duration_and_peak(
+        self,
+        audio_chunk_list: List[bytes],
+    ) -> "Tuple[float, float, float]":
+        """
+        Calculate overall RMS, duration and per-chunk peak RMS for raw PCM s16le audio chunks.
+        """
+        if not audio_chunk_list:
+            return 0.0, 0.0, 0.0
+
+        import numpy as np
+
+        total_squared = 0.0
+        total_samples = 0
+        peak_chunk_rms = 0.0
+
+        for audio_chunk in audio_chunk_list:
+            audio_array = np.frombuffer(audio_chunk, dtype=np.int16)
+            if len(audio_array) == 0:
+                continue
+
+            audio_float = audio_array.astype(np.float32) / 32768.0
+            chunk_squared = float(np.sum(audio_float**2))
+            total_squared += chunk_squared
+            total_samples += len(audio_array)
+            peak_chunk_rms = max(
+                peak_chunk_rms,
+                float(np.sqrt(chunk_squared / len(audio_array))),
+            )
+
+        if total_samples == 0:
+            return 0.0, 0.0, 0.0
+
+        rms_energy = float(np.sqrt(total_squared / total_samples))
+        duration = total_samples / self.sample_rate
+
+        return rms_energy, duration, peak_chunk_rms
+
+    def _should_transcribe_audio_clip(
+        self,
+        audio_chunk_list: List[bytes],
+        *,
+        task_type: str,
+    ) -> bool:
+        """
+        Guard the transcription queue from batches that are silent overall.
+
+        Per-chunk silence detection decides when pauses happen, but a buffer can
+        still be mostly or entirely silence after one above-threshold noise spike.
+        Whisper is prone to hallucinating text from that kind of input.
+        """
+        rms_energy, duration, peak_chunk_rms = self._audio_chunks_rms_duration_and_peak(
+            audio_chunk_list
+        )
+        if peak_chunk_rms < self.whisper_silence_threshold:
+            if self.verbose >= 1:
+                sys.stderr.write(
+                    "Skipping {} Whisper transcription: peak chunk RMS {:.4f} below "
+                    "threshold {:.4f} (clip RMS {:.4f}, {:.1f}s)\n".format(
+                        task_type,
+                        peak_chunk_rms,
+                        self.whisper_silence_threshold,
+                        rms_energy,
+                        duration,
+                    )
+                )
+            return False
+
+        return True
+
+    def _is_suspicious_low_energy_transcription(
+        self,
+        text: str,
+        *,
+        rms_energy: float,
+        duration: float,
+    ) -> bool:
+        """
+        Detect likely Whisper hallucinations from near-silent audio.
+        """
+        text_len = len(text.strip())
+        if text_len < self.LOW_ENERGY_TEXT_MIN_CHARS:
+            return False
+
+        if duration <= 0.0:
+            return True
+
+        low_energy_threshold = (
+            self.whisper_silence_threshold * self.LOW_ENERGY_TEXT_RMS_MULTIPLIER
+        )
+        if rms_energy >= low_energy_threshold:
+            return False
+
+        chars_per_second = text_len / duration
+        return chars_per_second >= self.LOW_ENERGY_TEXT_MAX_CHARS_PER_SECOND
+
     def _segments_to_text(self, segments: "Iterable[Any]") -> str:
         """Collect Whisper segments, dropping segments classified as no-speech."""
         text_parts = []
@@ -1247,16 +1347,34 @@ class WhisperEngine(STTEngine):
         if not audio_chunk_list:
             return ""
 
-        import numpy as np
-
         # Combine all audio chunks
         audio_data = b"".join(audio_chunk_list)
 
+        import numpy as np
+
         # Convert bytes to numpy array (s16le format = signed 16-bit little-endian)
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
+        if len(audio_array) == 0:
+            return ""
 
         # Convert to float32 in range [-1.0, 1.0] as required by Whisper
         audio_float = audio_array.astype(np.float32) / 32768.0
+        rms_energy, original_duration, peak_chunk_rms = self._audio_chunks_rms_duration_and_peak(
+            audio_chunk_list
+        )
+
+        if peak_chunk_rms < self.whisper_silence_threshold:
+            if self.verbose >= 1:
+                sys.stderr.write(
+                    "Skipping Whisper transcription: peak chunk RMS {:.4f} below "
+                    "threshold {:.4f} (clip RMS {:.4f}, {:.1f}s)\n".format(
+                        peak_chunk_rms,
+                        self.whisper_silence_threshold,
+                        rms_energy,
+                        original_duration,
+                    )
+                )
+            return ""
 
         # Whisper expects 16kHz audio. If we have a different sample rate, resample it.
         # faster-whisper claims to do this automatically, but it has issues with 44.1kHz audio.
@@ -1270,7 +1388,12 @@ class WhisperEngine(STTEngine):
 
         if self.verbose >= 1:
             duration = len(audio_float) / effective_sample_rate
-            sys.stderr.write("Transcribing {:.1f}s of audio...\n".format(duration))
+            sys.stderr.write(
+                "Transcribing {:.1f}s of audio (RMS {:.4f})...\n".format(
+                    duration,
+                    rms_energy,
+                )
+            )
 
         # Transcribe with Whisper
         assert self.model is not None
@@ -1293,6 +1416,22 @@ class WhisperEngine(STTEngine):
             )
 
             result = self._segments_to_text(segments)
+
+            if self._is_suspicious_low_energy_transcription(
+                result,
+                rms_energy=rms_energy,
+                duration=original_duration,
+            ):
+                if self.verbose >= 1:
+                    sys.stderr.write(
+                        "Suppressing likely Whisper hallucination from low-energy audio "
+                        "(RMS {:.4f}, {:.1f}s, {} chars)\n".format(
+                            rms_energy,
+                            original_duration,
+                            len(result),
+                        )
+                    )
+                return ""
 
             if self.verbose >= 1:
                 sys.stderr.write("Transcription complete: {!r}\n".format(result))
@@ -1401,14 +1540,15 @@ class WhisperEngine(STTEngine):
                 # Transcribe only NEW audio since last transcription (delta)
                 audio_to_transcribe = self.audio_buffer[self.last_transcribed_index:]
 
-                if self.verbose >= 1:
-                    sys.stderr.write("Short pause detected, queueing delta transcription\n")
+                if self._should_transcribe_audio_clip(audio_to_transcribe, task_type="delta"):
+                    if self.verbose >= 1:
+                        sys.stderr.write("Short pause detected, queueing delta transcription\n")
 
-                # Queue the transcription task
-                self.transcription_queue.put({
-                    "audio": audio_to_transcribe,
-                    "is_final": False,
-                })
+                    # Queue the transcription task
+                    self.transcription_queue.put({
+                        "audio": audio_to_transcribe,
+                        "is_final": False,
+                    })
 
                 # Update last transcribed position
                 self.last_transcribed_index = len(self.audio_buffer)
@@ -1420,20 +1560,30 @@ class WhisperEngine(STTEngine):
         if self.long_silence_timer >= self.whisper_silence_finalize:
             # Only trigger if not already transcribing
             if self.transcription_queue.empty():
-                if self.verbose >= 1:
-                    sys.stderr.write("Long pause detected, queueing full transcription\n")
+                audio_to_transcribe = self.audio_buffer[:]
+                if self._should_transcribe_audio_clip(audio_to_transcribe, task_type="final"):
+                    if self.verbose >= 1:
+                        sys.stderr.write("Long pause detected, queueing full transcription\n")
 
-                # Re-transcribe ENTIRE buffer for best quality
-                self.transcription_queue.put({
-                    "audio": self.audio_buffer[:],  # Full buffer copy
-                    "is_final": True,
-                })
+                    # Re-transcribe ENTIRE buffer for best quality
+                    self.transcription_queue.put({
+                        "audio": audio_to_transcribe,  # Full buffer copy
+                        "is_final": True,
+                    })
+                else:
+                    with self.result_lock:
+                        self.pending_result = ""
+                        self.pending_result_is_final = True
+                    self.audio_buffer.clear()
+                    self.last_transcribed_index = 0
+                    self.has_speech = False
+                    self.cumulative_output = ""
 
             # Reset timers (don't trigger again)
             self.short_silence_timer = 0.0
             self.long_silence_timer = 0.0
 
-            return True  # Signal finalization
+            return False  # Final Whisper results are delivered by the worker.
 
         return False  # Keep buffering
 

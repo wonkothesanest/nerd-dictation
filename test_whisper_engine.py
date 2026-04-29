@@ -205,9 +205,120 @@ def test_whisper_silence_only_audio_does_not_queue_transcription():
 
     print("  ✓ Silence-only audio does not queue transcription")
 
+def test_whisper_low_rms_queue_guard():
+    """Test that mostly silent queued clips are not sent to Whisper."""
+    print("\nTest 6: Whisper low-RMS queue guard...")
+
+    if not HAS_NUMPY:
+        print("  ⚠ Skipping (numpy not available)")
+        return
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        whisper_silence_duration=0.1,
+        whisper_silence_finalize=0.2,
+        whisper_silence_threshold=0.01,
+        verbose=0
+    )
+
+    click = np.zeros(16000, dtype=np.int16)
+    click[0] = 32767
+    click_chunk = click.tobytes()
+    silence_chunk = np.zeros(1600, dtype=np.int16).tobytes()
+
+    is_silence_results = [False, True, True]
+
+    def fake_is_silence(_data):
+        return is_silence_results.pop(0)
+
+    engine._is_silence = fake_is_silence
+
+    assert engine.process_audio_chunk(click_chunk) == False
+    assert engine.process_audio_chunk(silence_chunk) == False
+    assert engine.transcription_queue.empty()
+    assert engine.last_transcribed_index == 2
+
+    assert engine.process_audio_chunk(silence_chunk) == False
+    assert engine.transcription_queue.empty()
+    assert engine.audio_buffer == []
+    assert engine.has_speech == False
+    assert engine.get_transcription_result() == ("", True)
+
+    print("  ✓ Low-RMS queued clips are suppressed")
+
+def test_whisper_speech_chunk_in_low_rms_clip_is_queued():
+    """Test that a low-overall-RMS clip still queues when one chunk is speech."""
+    print("\nTest 7: Whisper low-RMS clip with speech chunk queues...")
+
+    if not HAS_NUMPY:
+        print("  ⚠ Skipping (numpy not available)")
+        return
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        whisper_silence_duration=0.3,
+        whisper_silence_finalize=2.0,
+        whisper_silence_threshold=0.01,
+        verbose=0
+    )
+
+    def chunk_with_rms(rms):
+        value = int(rms * 32768)
+        return np.full(1600, value, dtype=np.int16).tobytes()
+
+    for rms in (0.0085, 0.0047, 0.0142, 0.0085, 0.0086, 0.0019):
+        assert engine.process_audio_chunk(chunk_with_rms(rms)) == False
+
+    assert engine.has_speech == True
+    assert engine.transcription_queue.empty() == False
+
+    task = engine.transcription_queue.get_nowait()
+    assert task["is_final"] == False
+
+    clip_rms, duration, peak_chunk_rms = engine._audio_chunks_rms_duration_and_peak(task["audio"])
+    assert clip_rms < 0.01
+    assert peak_chunk_rms >= 0.01
+    assert duration == 0.6
+
+    print("  ✓ Speech chunk keeps low-overall-RMS clip eligible")
+
+def test_whisper_low_energy_hallucination_guard():
+    """Test that long text from low-energy audio is suppressed."""
+    print("\nTest 8: Whisper low-energy hallucination guard...")
+
+    if not HAS_NUMPY:
+        print("  ⚠ Skipping (numpy not available)")
+        return
+
+    class FakeSegment:
+        text = "hey i want a pizza " * 8
+        no_speech_prob = 0.0
+
+    class FakeModel:
+        def transcribe(self, _audio_float, **_kwargs):
+            return [FakeSegment()], None
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        whisper_silence_threshold=0.01,
+        verbose=0
+    )
+    engine.model = FakeModel()
+
+    low_energy_audio = np.full(32000, 393, dtype=np.int16).tobytes()
+    assert engine._transcribe_audio_chunk([low_energy_audio]) == ""
+
+    print("  ✓ Low-energy hallucinated text is suppressed")
+
 def test_whisper_engine_interface():
     """Test that WhisperEngine implements the STTEngine interface."""
-    print("\nTest 6: STTEngine interface compliance...")
+    print("\nTest 9: STTEngine interface compliance...")
 
     engine = WhisperEngine(
         whisper_model="tiny",
@@ -241,7 +352,7 @@ def test_whisper_engine_interface():
 
 def test_abstract_base_class():
     """Test that STTEngine is properly defined as an abstract base."""
-    print("\nTest 7: STTEngine abstract base class...")
+    print("\nTest 10: STTEngine abstract base class...")
 
     # Try to call abstract methods (should raise NotImplementedError)
     engine = STTEngine()
@@ -271,6 +382,9 @@ def main():
         test_whisper_engine_audio_buffering()
         test_whisper_no_speech_gate()
         test_whisper_silence_only_audio_does_not_queue_transcription()
+        test_whisper_low_rms_queue_guard()
+        test_whisper_speech_chunk_in_low_rms_clip_is_queued()
+        test_whisper_low_energy_hallucination_guard()
         test_whisper_engine_interface()
         model_initialized = test_whisper_engine_initialization()
 
