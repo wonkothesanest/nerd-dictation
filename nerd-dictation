@@ -1059,7 +1059,9 @@ class WhisperEngine(STTEngine):
 
     LOW_ENERGY_TEXT_RMS_MULTIPLIER = 1.5
     LOW_ENERGY_TEXT_MIN_CHARS = 80
-    LOW_ENERGY_TEXT_MAX_CHARS_PER_SECOND = 25.0
+    LOW_ENERGY_TEXT_MAX_CHARS_PER_SECOND = 40.0
+    LOW_ENERGY_TEXT_MIN_REPETITION_WORDS = 20
+    LOW_ENERGY_TEXT_MAX_UNIQUE_WORD_RATIO = 0.35
 
     def __init__(
         self,
@@ -1089,6 +1091,7 @@ class WhisperEngine(STTEngine):
         self.whisper_silence_threshold = whisper_silence_threshold
         self.whisper_no_speech_threshold = whisper_no_speech_threshold
         self.verbose = verbose
+        self.debug_start_time = time.monotonic()
 
         # Will be initialized in initialize()
         self.model: "Optional[Any]" = None
@@ -1112,21 +1115,41 @@ class WhisperEngine(STTEngine):
         import queue
         self.transcription_thread: "Optional[threading.Thread]" = None
         self.transcription_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self.result_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.worker_thread: "Optional[threading.Thread]" = None
         self.worker_shutdown = False
+        self.worker_busy = False
+        self.transcription_tasks_in_flight = 0
         self.result_lock = threading.Lock()
 
         # Results tracking
-        self.pending_result: Optional[str] = None
-        self.pending_result_is_final = False
         self.intermediate_outputs: List[str] = []  # Track outputs for final erase
+        self.audio_buffer_has_speech: List[bool] = []
+        self.last_audio_energy_log_time = 0.0
+
+    def _debug_write(self, text: str) -> None:
+        """Write timestamped Whisper debug output to stderr."""
+        time_now = time.time()
+        wall_time = time.strftime("%H:%M:%S", time.localtime(time_now))
+        elapsed = time.monotonic() - self.debug_start_time
+        prefix = "[{}.{:03d} +{:.3f}s] ".format(
+            wall_time,
+            int((time_now % 1.0) * 1000),
+            elapsed,
+        )
+
+        for line in text.splitlines(True):
+            if line == "\n":
+                sys.stderr.write(line)
+            else:
+                sys.stderr.write(prefix + line)
 
     def initialize(self) -> None:
         """Initialize Whisper model and start worker thread."""
         from faster_whisper import WhisperModel
 
         if self.verbose >= 1:
-            sys.stderr.write("Loading Whisper model ({})...\n".format(self.whisper_model))
+            self._debug_write("Loading Whisper model ({})...\n".format(self.whisper_model))
 
         # Create model directory if it doesn't exist
         if not os.path.exists(self.whisper_model_dir):
@@ -1147,7 +1170,7 @@ class WhisperEngine(STTEngine):
             # If float16 fails (common on CPU), fall back to int8
             if "float16" in str(ex) and compute_type == "float16":
                 if self.verbose >= 1:
-                    sys.stderr.write(
+                    self._debug_write(
                         "Warning: float16 not supported on this system, falling back to int8...\n"
                     )
                 compute_type = "int8"
@@ -1161,7 +1184,7 @@ class WhisperEngine(STTEngine):
                 raise
 
         if self.verbose >= 1:
-            sys.stderr.write("Whisper model loaded (compute type: {}).\n".format(compute_type))
+            self._debug_write("Whisper model loaded (compute type: {}).\n".format(compute_type))
 
         # Start worker thread for background transcription
         import threading
@@ -1199,7 +1222,14 @@ class WhisperEngine(STTEngine):
         is_silent = rms_energy < self.whisper_silence_threshold
 
         if self.verbose >= 2:
-            sys.stderr.write(
+            time_now = time.time()
+            should_log_energy = (time_now - self.last_audio_energy_log_time) >= 0.5
+        else:
+            should_log_energy = False
+
+        if should_log_energy:
+            self.last_audio_energy_log_time = time_now
+            self._debug_write(
                 "Audio energy: {:.4f} (threshold: {:.4f}) - {}\n".format(
                     rms_energy, self.whisper_silence_threshold, "SILENCE" if is_silent else "SPEECH"
                 )
@@ -1263,7 +1293,7 @@ class WhisperEngine(STTEngine):
         )
         if peak_chunk_rms < self.whisper_silence_threshold:
             if self.verbose >= 1:
-                sys.stderr.write(
+                self._debug_write(
                     "Skipping {} Whisper transcription: peak chunk RMS {:.4f} below "
                     "threshold {:.4f} (clip RMS {:.4f}, {:.1f}s)\n".format(
                         task_type,
@@ -1301,7 +1331,66 @@ class WhisperEngine(STTEngine):
             return False
 
         chars_per_second = text_len / duration
-        return chars_per_second >= self.LOW_ENERGY_TEXT_MAX_CHARS_PER_SECOND
+        if chars_per_second >= self.LOW_ENERGY_TEXT_MAX_CHARS_PER_SECOND:
+            return True
+
+        words = text.lower().replace(".", " ").replace(",", " ").split()
+        if len(words) < self.LOW_ENERGY_TEXT_MIN_REPETITION_WORDS:
+            return False
+
+        unique_word_ratio = len(set(words)) / len(words)
+        return unique_word_ratio <= self.LOW_ENERGY_TEXT_MAX_UNIQUE_WORD_RATIO
+
+    def _has_transcription_in_progress(self) -> bool:
+        """Return true when the worker is busy or has queued work."""
+        with self.result_lock:
+            return self.transcription_tasks_in_flight > 0 or not self.result_queue.empty()
+
+    def _queue_transcription_task(
+        self,
+        *,
+        audio: List[bytes],
+        is_final: bool,
+        start_index: int,
+        end_index: int,
+    ) -> None:
+        with self.result_lock:
+            self.transcription_tasks_in_flight += 1
+
+        self.transcription_queue.put({
+            "audio": audio,
+            "is_final": is_final,
+            "start_index": start_index,
+            "end_index": end_index,
+        })
+
+    def _queue_transcription_result(
+        self,
+        *,
+        text: str,
+        is_final: bool,
+        start_index: int,
+        end_index: int,
+    ) -> None:
+        self.result_queue.put({
+            "text": text,
+            "is_final": is_final,
+            "start_index": start_index,
+            "end_index": end_index,
+        })
+
+    def _trim_finalized_audio(self, end_index: int) -> None:
+        """
+        Drop only the chunks covered by a completed final transcription.
+        """
+        trim_count = min(end_index, len(self.audio_buffer))
+        if trim_count <= 0:
+            return
+
+        del self.audio_buffer[:trim_count]
+        del self.audio_buffer_has_speech[:trim_count]
+        self.last_transcribed_index = max(0, self.last_transcribed_index - trim_count)
+        self.has_speech = any(self.audio_buffer_has_speech)
 
     def _segments_to_text(self, segments: "Iterable[Any]") -> str:
         """Collect Whisper segments, dropping segments classified as no-speech."""
@@ -1316,7 +1405,7 @@ class WhisperEngine(STTEngine):
             ):
                 skipped_segments += 1
                 if self.verbose >= 1:
-                    sys.stderr.write(
+                    self._debug_write(
                         "Skipping Whisper no-speech segment "
                         "(probability: {:.3f}, threshold: {:.3f})\n".format(
                             no_speech_prob, self.whisper_no_speech_threshold
@@ -1329,7 +1418,7 @@ class WhisperEngine(STTEngine):
         result = "".join(text_parts).strip()
 
         if self.verbose >= 1 and skipped_segments and not result:
-            sys.stderr.write("Whisper no-speech gate suppressed transcription.\n")
+            self._debug_write("Whisper no-speech gate suppressed transcription.\n")
 
         return result
 
@@ -1365,7 +1454,7 @@ class WhisperEngine(STTEngine):
 
         if peak_chunk_rms < self.whisper_silence_threshold:
             if self.verbose >= 1:
-                sys.stderr.write(
+                self._debug_write(
                     "Skipping Whisper transcription: peak chunk RMS {:.4f} below "
                     "threshold {:.4f} (clip RMS {:.4f}, {:.1f}s)\n".format(
                         peak_chunk_rms,
@@ -1388,7 +1477,7 @@ class WhisperEngine(STTEngine):
 
         if self.verbose >= 1:
             duration = len(audio_float) / effective_sample_rate
-            sys.stderr.write(
+            self._debug_write(
                 "Transcribing {:.1f}s of audio (RMS {:.4f})...\n".format(
                     duration,
                     rms_energy,
@@ -1423,7 +1512,7 @@ class WhisperEngine(STTEngine):
                 duration=original_duration,
             ):
                 if self.verbose >= 1:
-                    sys.stderr.write(
+                    self._debug_write(
                         "Suppressing likely Whisper hallucination from low-energy audio "
                         "(RMS {:.4f}, {:.1f}s, {} chars)\n".format(
                             rms_energy,
@@ -1434,18 +1523,17 @@ class WhisperEngine(STTEngine):
                 return ""
 
             if self.verbose >= 1:
-                sys.stderr.write("Transcription complete: {!r}\n".format(result))
+                self._debug_write("Transcription complete: {!r}\n".format(result))
 
             return result
 
         except Exception as ex:
-            sys.stderr.write("Whisper transcription error: {!s}\n".format(ex))
+            self._debug_write("Whisper transcription error: {!s}\n".format(ex))
             return ""
 
     def _transcription_worker(self) -> None:
         """
         Worker thread that processes transcription tasks from the queue.
-        Implements queue coalescing to skip obsolete intermediate transcriptions.
         """
         import queue as queue_module
 
@@ -1457,44 +1545,44 @@ class WhisperEngine(STTEngine):
                 if task is None:  # Shutdown signal
                     break
 
-                # Queue coalescing: if multiple tasks are pending, skip to the latest
-                # This prevents transcribing stale audio when user speaks faster than transcription
-                while not self.transcription_queue.empty():
-                    try:
-                        next_task = self.transcription_queue.get_nowait()
-                        if next_task is None:
-                            break
-                        # Skip current task, use the newer one
-                        task = next_task
-                        if self.verbose >= 1:
-                            sys.stderr.write("Queue coalescing: skipping obsolete transcription\n")
-                    except queue_module.Empty:
-                        break
-
                 # Process the task
                 audio_to_transcribe = task["audio"]
                 is_final = task["is_final"]
+                start_index = task["start_index"]
+                end_index = task["end_index"]
 
                 if self.verbose >= 1:
                     task_type = "final" if is_final else "intermediate"
-                    sys.stderr.write("Worker: starting {} transcription\n".format(task_type))
+                    self._debug_write("Worker: starting {} transcription\n".format(task_type))
 
-                # Perform transcription
-                result = self._transcribe_audio_chunk(audio_to_transcribe)
-
-                # Store result for main thread to retrieve
                 with self.result_lock:
-                    self.pending_result = result
-                    self.pending_result_is_final = is_final
+                    self.worker_busy = True
+
+                try:
+                    # Perform transcription
+                    result = self._transcribe_audio_chunk(audio_to_transcribe)
+                    self._queue_transcription_result(
+                        text=result,
+                        is_final=is_final,
+                        start_index=start_index,
+                        end_index=end_index,
+                    )
+                finally:
+                    with self.result_lock:
+                        self.worker_busy = False
+                        self.transcription_tasks_in_flight = max(
+                            0,
+                            self.transcription_tasks_in_flight - 1,
+                        )
 
                 if self.verbose >= 1:
-                    sys.stderr.write("Worker: transcription ready\n")
+                    self._debug_write("Worker: transcription ready\n")
 
             except queue_module.Empty:
                 # Timeout, check shutdown flag and continue
                 continue
             except Exception as ex:
-                sys.stderr.write("Worker thread error: {!s}\n".format(ex))
+                self._debug_write("Worker thread error: {!s}\n".format(ex))
                 import traceback
                 traceback.print_exc()
 
@@ -1514,6 +1602,7 @@ class WhisperEngine(STTEngine):
 
         # Check if this chunk is silence
         is_silent = self._is_silence(data)
+        self.audio_buffer_has_speech.append(not is_silent)
 
         if not is_silent:
             # We have speech, reset both silence timers
@@ -1533,57 +1622,74 @@ class WhisperEngine(STTEngine):
         self.short_silence_timer += chunk_duration
         self.long_silence_timer += chunk_duration
 
+        # Check for long pause (finalization) before short pause. If both timers
+        # are due, finalization is the useful work; queueing another intermediate
+        # pass only delays the final result on slow Whisper models.
+        if self.long_silence_timer >= self.whisper_silence_finalize:
+            # Only trigger if not already transcribing
+            if not self._has_transcription_in_progress():
+                start_index = 0
+                end_index = len(self.audio_buffer)
+                audio_to_transcribe = self.audio_buffer[start_index:end_index]
+                if self._should_transcribe_audio_clip(audio_to_transcribe, task_type="final"):
+                    if self.verbose >= 1:
+                        self._debug_write("Long pause detected, queueing full transcription\n")
+
+                    # Re-transcribe ENTIRE buffer for best quality
+                    self._queue_transcription_task(
+                        audio=audio_to_transcribe,  # Full buffer copy
+                        is_final=True,
+                        start_index=start_index,
+                        end_index=end_index,
+                    )
+                else:
+                    self._queue_transcription_result(
+                        text="",
+                        is_final=True,
+                        start_index=start_index,
+                        end_index=end_index,
+                    )
+                    self.audio_buffer.clear()
+                    self.audio_buffer_has_speech.clear()
+                    self.last_transcribed_index = 0
+                    self.has_speech = False
+                    self.cumulative_output = ""
+
+                # Reset timers only when finalization was handled.
+                self.short_silence_timer = 0.0
+                self.long_silence_timer = 0.0
+
+            return False  # Final Whisper results are delivered by the worker.
+
         # Check for short pause (intermediate transcription)
         if self.short_silence_timer >= self.whisper_silence_duration:
             # Only trigger if not already transcribing and we have new audio
-            if self.transcription_queue.empty() and self.last_transcribed_index < len(self.audio_buffer):
+            if (
+                not self._has_transcription_in_progress()
+                and self.last_transcribed_index < len(self.audio_buffer)
+            ):
                 # Transcribe only NEW audio since last transcription (delta)
-                audio_to_transcribe = self.audio_buffer[self.last_transcribed_index:]
+                start_index = self.last_transcribed_index
+                end_index = len(self.audio_buffer)
+                audio_to_transcribe = self.audio_buffer[start_index:end_index]
 
                 if self._should_transcribe_audio_clip(audio_to_transcribe, task_type="delta"):
                     if self.verbose >= 1:
-                        sys.stderr.write("Short pause detected, queueing delta transcription\n")
+                        self._debug_write("Short pause detected, queueing delta transcription\n")
 
                     # Queue the transcription task
-                    self.transcription_queue.put({
-                        "audio": audio_to_transcribe,
-                        "is_final": False,
-                    })
+                    self._queue_transcription_task(
+                        audio=audio_to_transcribe,
+                        is_final=False,
+                        start_index=start_index,
+                        end_index=end_index,
+                    )
 
                 # Update last transcribed position
                 self.last_transcribed_index = len(self.audio_buffer)
 
             # Reset short timer (don't trigger again until more speech)
             self.short_silence_timer = 0.0
-
-        # Check for long pause (finalization)
-        if self.long_silence_timer >= self.whisper_silence_finalize:
-            # Only trigger if not already transcribing
-            if self.transcription_queue.empty():
-                audio_to_transcribe = self.audio_buffer[:]
-                if self._should_transcribe_audio_clip(audio_to_transcribe, task_type="final"):
-                    if self.verbose >= 1:
-                        sys.stderr.write("Long pause detected, queueing full transcription\n")
-
-                    # Re-transcribe ENTIRE buffer for best quality
-                    self.transcription_queue.put({
-                        "audio": audio_to_transcribe,  # Full buffer copy
-                        "is_final": True,
-                    })
-                else:
-                    with self.result_lock:
-                        self.pending_result = ""
-                        self.pending_result_is_final = True
-                    self.audio_buffer.clear()
-                    self.last_transcribed_index = 0
-                    self.has_speech = False
-                    self.cumulative_output = ""
-
-            # Reset timers (don't trigger again)
-            self.short_silence_timer = 0.0
-            self.long_silence_timer = 0.0
-
-            return False  # Final Whisper results are delivered by the worker.
 
         return False  # Keep buffering
 
@@ -1600,14 +1706,16 @@ class WhisperEngine(STTEngine):
             - text: The full cumulative transcription text
             - is_final: True if this is the final transcription (long pause)
         """
-        with self.result_lock:
-            if self.pending_result is None:
-                return None
+        import queue as queue_module
 
-            result = self.pending_result
-            is_final = self.pending_result_is_final
-            self.pending_result = None
-            self.pending_result_is_final = False
+        try:
+            result_data = self.result_queue.get_nowait()
+        except queue_module.Empty:
+            return None
+
+        result = result_data["text"]
+        is_final = result_data["is_final"]
+        end_index = result_data["end_index"]
 
         # For intermediate results, append to cumulative output
         # For final results, replace entire cumulative output (full re-transcription)
@@ -1620,7 +1728,7 @@ class WhisperEngine(STTEngine):
 
         if self.verbose >= 1:
             result_type = "Final" if is_final else "Intermediate"
-            sys.stderr.write(
+            self._debug_write(
                 "{} result ready: {} chars total\n".format(
                     result_type, len(self.cumulative_output)
                 )
@@ -1628,10 +1736,8 @@ class WhisperEngine(STTEngine):
 
         # If this is a final result, clear state for next utterance
         if is_final:
-            self.audio_buffer.clear()
-            self.last_transcribed_index = 0
+            self._trim_finalized_audio(end_index)
             self.intermediate_outputs.clear()
-            self.has_speech = False
             # Return the text, then clear cumulative for next utterance
             final_text = self.cumulative_output
             self.cumulative_output = ""
@@ -1659,42 +1765,49 @@ class WhisperEngine(STTEngine):
         if self.audio_buffer:
             if not self.has_speech:
                 if self.verbose >= 1:
-                    sys.stderr.write("Manual end: no speech detected, skipping Whisper transcription\n")
+                    self._debug_write("Manual end: no speech detected, skipping Whisper transcription\n")
                 self.audio_buffer.clear()
+                self.audio_buffer_has_speech.clear()
                 self.last_transcribed_index = 0
                 self.intermediate_outputs.clear()
                 self.cumulative_output = ""
                 return ""
 
             if self.verbose >= 1:
-                sys.stderr.write("Manual end: transcribing remaining buffer\n")
+                self._debug_write("Manual end: transcribing remaining buffer\n")
 
             # Wait for any pending transcription to finish
             if self.worker_thread and self.worker_thread.is_alive():
                 import time
                 timeout = 10.0
                 start_time = time.time()
-                while not self.transcription_queue.empty():
+                while self._has_transcription_in_progress():
                     if time.time() - start_time > timeout:
-                        sys.stderr.write("Warning: transcription queue timeout\n")
+                        self._debug_write("Warning: transcription queue timeout\n")
                         break
                     time.sleep(0.1)
 
             # Check if there's a pending result
-            with self.result_lock:
-                if self.pending_result is not None:
-                    result = self.pending_result
-                    self.pending_result = None
-                    # Clear state
-                    self.audio_buffer.clear()
-                    self.last_transcribed_index = 0
-                    self.intermediate_outputs.clear()
-                    self.cumulative_output = ""
-                    return result
+            import queue as queue_module
+            try:
+                result_data = self.result_queue.get_nowait()
+            except queue_module.Empty:
+                result_data = None
+
+            if result_data is not None:
+                result = result_data["text"]
+                # Clear state
+                self.audio_buffer.clear()
+                self.audio_buffer_has_speech.clear()
+                self.last_transcribed_index = 0
+                self.intermediate_outputs.clear()
+                self.cumulative_output = ""
+                return result
 
             # Otherwise transcribe remaining buffer directly
             result = self._transcribe_audio_chunk(self.audio_buffer)
             self.audio_buffer.clear()
+            self.audio_buffer_has_speech.clear()
             self.last_transcribed_index = 0
             self.intermediate_outputs.clear()
             self.cumulative_output = ""
@@ -1705,16 +1818,37 @@ class WhisperEngine(STTEngine):
     def reset(self) -> None:
         """Clear audio buffer and silence detection state."""
         self.audio_buffer.clear()
+        self.audio_buffer_has_speech.clear()
         self.last_transcribed_index = 0
         self.short_silence_timer = 0.0
         self.long_silence_timer = 0.0
         self.has_speech = False
         self.intermediate_outputs.clear()
         self.cumulative_output = ""
+        self.last_audio_energy_log_time = 0.0
 
-        with self.result_lock:
-            self.pending_result = None
-            self.pending_result_is_final = False
+        import queue as queue_module
+        while True:
+            try:
+                self.result_queue.get_nowait()
+            except queue_module.Empty:
+                break
+
+        cleared_transcription_tasks = 0
+        while True:
+            try:
+                task = self.transcription_queue.get_nowait()
+            except queue_module.Empty:
+                break
+            if task is not None:
+                cleared_transcription_tasks += 1
+
+        if cleared_transcription_tasks:
+            with self.result_lock:
+                self.transcription_tasks_in_flight = max(
+                    0,
+                    self.transcription_tasks_in_flight - cleared_transcription_tasks,
+                )
 
     def shutdown(self) -> None:
         """Shutdown the worker thread."""
@@ -1817,16 +1951,110 @@ def text_from_stt_engine(
     def recording_proc_start() -> "Tuple[subprocess.Popen[bytes], IO[bytes]]":
         return recording_proc_with_non_blocking_stdout(input_method, sample_rate, pulse_device_name)
 
+    # 1mb
+    block_size = 1_048_576
+
+    threaded_audio_reader = isinstance(stt_engine, WhisperEngine)
+    if threaded_audio_reader:
+        import queue as audio_queue_module
+        import threading as audio_threading
+
+        audio_queue: "Optional[audio_queue_module.Queue[bytes]]" = audio_queue_module.Queue()
+        audio_reader_shutdown: "Optional[audio_threading.Event]" = audio_threading.Event()
+        audio_reader_thread: "Optional[audio_threading.Thread]" = None
+    else:
+        audio_queue = None
+        audio_reader_shutdown = None
+        audio_reader_thread = None
+
+    def audio_reader_loop(
+        file_handle: IO[bytes],
+        shutdown_event: "Any",
+        output_queue: "Any",
+    ) -> None:
+        while not shutdown_event.is_set():
+            try:
+                data_read = file_handle.read(block_size)
+            except (ValueError, OSError):
+                break
+
+            if data_read:
+                output_queue.put(data_read)
+            else:
+                time.sleep(0.005)
+
+    def audio_reader_start(file_handle: IO[bytes]) -> None:
+        nonlocal audio_reader_shutdown
+        nonlocal audio_reader_thread
+
+        if not threaded_audio_reader:
+            return
+
+        assert audio_queue is not None
+        assert audio_reader_shutdown is not None
+
+        audio_reader_shutdown = audio_threading.Event()
+        audio_reader_thread = audio_threading.Thread(
+            target=audio_reader_loop,
+            args=(file_handle, audio_reader_shutdown, audio_queue),
+            daemon=True,
+        )
+        audio_reader_thread.start()
+
+    def audio_reader_stop() -> None:
+        nonlocal audio_reader_thread
+
+        if not threaded_audio_reader:
+            return
+
+        assert audio_reader_shutdown is not None
+        audio_reader_shutdown.set()
+
+        if audio_reader_thread is not None and audio_reader_thread.is_alive():
+            audio_reader_thread.join(timeout=1.0)
+        audio_reader_thread = None
+
+    def audio_queue_clear() -> None:
+        if not threaded_audio_reader:
+            return
+
+        assert audio_queue is not None
+        while True:
+            try:
+                audio_queue.get_nowait()
+            except audio_queue_module.Empty:
+                break
+
+    def audio_data_read() -> "Optional[bytes]":
+        if threaded_audio_reader:
+            if not has_ps:
+                do_suspend_resume()
+                return None
+
+            assert audio_queue is not None
+            try:
+                return audio_queue.get_nowait()
+            except audio_queue_module.Empty:
+                return None
+
+        try:
+            return stdout.read(block_size)
+        except (NameError, ValueError):
+            # Start recording if `stdout` is not yet open (NameError), or if it
+            # was closed via suspend (ValueError).  This can happen either due
+            # to a suspend/resume cycle (SIGUSR1/SIGTSTP->SIGCONT) or when
+            # --suspend-on-start was specified followed by a SIGCONT.
+            do_suspend_resume()
+            return None
+
     has_ps = False
     if not suspend_on_start:
         ps, stdout = recording_proc_start()
         has_ps = True
+        audio_reader_start(stdout)
 
     # Initialize the STT engine (loads model, etc.)
     stt_engine.initialize()
-
-    # 1mb
-    block_size = 1_048_576
 
     use_timeout = timeout != 0.0
     if use_timeout:
@@ -1914,6 +2142,78 @@ def text_from_stt_engine(
             handle_fn_wrapper(text, True)
         return text
 
+    def engine_process_audio_data(data: bytes) -> None:
+        nonlocal code
+        nonlocal timeout_text_prev
+        nonlocal timeout_time_prev
+
+        is_final = stt_engine.process_audio_chunk(data)
+        if is_final:
+            result_text = engine_handle_final_result()
+        else:
+            result_text = engine_handle_partial_result()
+
+        # Monitor the output.
+        # Finish if no changes are made for `timeout` seconds.
+        if use_timeout:
+            if result_text and result_text != timeout_text_prev:
+                timeout_text_prev = result_text
+                timeout_time_prev = time.time()
+            elif time.time() - timeout_time_prev > timeout:
+                if code == 0:
+                    code = 1  # The time was exceeded, exit!
+
+    def audio_queue_drain_to_engine() -> None:
+        if not threaded_audio_reader:
+            return
+
+        assert audio_queue is not None
+        while True:
+            try:
+                queued_data = audio_queue.get_nowait()
+            except audio_queue_module.Empty:
+                break
+            engine_process_audio_data(queued_data)
+
+    def whisper_results_handle_available() -> None:
+        nonlocal timeout_text_prev
+        nonlocal timeout_time_prev
+        nonlocal handled_any
+
+        if not isinstance(stt_engine, WhisperEngine):
+            return
+
+        while True:
+            whisper_result = stt_engine.get_transcription_result()
+            if whisper_result is None:
+                return
+
+            text, is_final_result = whisper_result
+
+            # Use handle_fn_wrapper() just like VOSK does
+            # is_partial=True for intermediate results, False for final results
+            handle_fn_wrapper(text, not is_final_result)
+            handled_any = True
+
+            # Update timeout tracking with the text (before process_fn)
+            if use_timeout and text:
+                timeout_text_prev = text
+                timeout_time_prev = time.time()
+
+    def audio_input_process_available() -> None:
+        whisper_results_handle_available()
+
+        if threaded_audio_reader:
+            audio_queue_drain_to_engine()
+            whisper_results_handle_available()
+            return
+
+        # Mostly the data read is quite small (under 1k).
+        # Only the 1st entry in the loop reads a lot of data due to the time it takes to initialize the VOSK module.
+        data = audio_data_read()
+        if data:
+            engine_process_audio_data(data)
+
     if not suspend_on_start:
         # Support setting up input simulation state.
         handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
@@ -1930,10 +2230,24 @@ def text_from_stt_engine(
 
     def do_suspend_pause() -> None:
         nonlocal has_ps, ps, stdout
+        if threaded_audio_reader and has_ps:
+            audio_reader_stop()
+
+            # Support setting up input simulation state.
+            handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+
+            stdout.close()
+            os.kill(ps.pid, signal.SIGINT)
+            del stdout, ps
+            has_ps = False
+
+            audio_queue_drain_to_engine()
+
         engine_handle_final_result()
 
         # Don't include any of the current analysis when resuming.
         stt_engine.reset()
+        audio_queue_clear()
 
         # Clear the buffer:
         handle_fn_suspended()
@@ -1965,6 +2279,7 @@ def text_from_stt_engine(
         handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
         ps, stdout = recording_proc_start()
         has_ps = True
+        audio_reader_start(stdout)
 
     def handle_sig_suspend_from_usr1(_signum: int, _frame: Optional[FrameType]) -> None:
         nonlocal suspend
@@ -2034,53 +2349,14 @@ def text_from_stt_engine(
             else:
                 idle_time_prev = idle_time_curr
 
-        # Mostly the data read is quite small (under 1k).
-        # Only the 1st entry in the loop reads a lot of data due to the time it takes to initialize the VOSK module.
-        try:
-            data = stdout.read(block_size)
-        except (NameError, ValueError):
-            # Start recording if `stdout` is not yet open (NameError), or if it
-            # was closed via suspend (ValueError).  This can happen either due
-            # to a suspend/resume cycle (SIGUSR1/SIGTSTP->SIGCONT) or when
-            # --suspend-on-start was specified followed by a SIGCONT.
-            do_suspend_resume()
-            continue
+        audio_input_process_available()
 
-        if data:
-            is_final = stt_engine.process_audio_chunk(data)
-            if is_final:
-                result_text = engine_handle_final_result()
-            else:
-                result_text = engine_handle_partial_result()
-
-            # Monitor the output.
-            # Finish if no changes are made for `timeout` seconds.
-            if use_timeout:
-                if result_text and result_text != timeout_text_prev:
-                    timeout_text_prev = result_text
-                    timeout_time_prev = time.time()
-                elif time.time() - timeout_time_prev > timeout:
-                    if code == 0:
-                        code = 1  # The time was exceeded, exit!
-
-        # Check for completed Whisper transcription results (if using WhisperEngine)
-        if isinstance(stt_engine, WhisperEngine):
-            whisper_result = stt_engine.get_transcription_result()
-            if whisper_result is not None:
-                text, is_final_result = whisper_result
-
-                # Use handle_fn_wrapper() just like VOSK does
-                # is_partial=True for intermediate results, False for final results
-                handle_fn_wrapper(text, not is_final_result)
-                handled_any = True
-
-                # Update timeout tracking with the text (before process_fn)
-                if use_timeout and text:
-                    timeout_text_prev = text
-                    timeout_time_prev = time.time()
+        whisper_results_handle_available()
 
     # Close the recording process.
     if has_ps:
+        audio_reader_stop()
+
         # stdout.close(), no need, this is exiting.
         os.kill(ps.pid, signal.SIGINT)
         del ps, stdout
@@ -2088,6 +2364,8 @@ def text_from_stt_engine(
 
         # Support setting up input simulation state.
         handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+
+    audio_queue_drain_to_engine()
 
     if code == -1:
         sys.stderr.write("Text input canceled!\n")

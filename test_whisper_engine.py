@@ -314,11 +314,123 @@ def test_whisper_low_energy_hallucination_guard():
     low_energy_audio = np.full(32000, 393, dtype=np.int16).tobytes()
     assert engine._transcribe_audio_chunk([low_energy_audio]) == ""
 
+    repeated_hallucination = (
+        "I'm going to use the same method for the other side as well. " * 5
+    )
+    assert engine._is_suspicious_low_energy_transcription(
+        repeated_hallucination,
+        rms_energy=0.0029,
+        duration=20.1,
+    ) == True
+
+    quiet_short_result = "ten nine eight seven six five four three two one"
+    assert engine._is_suspicious_low_energy_transcription(
+        quiet_short_result,
+        rms_energy=0.0075,
+        duration=22.2,
+    ) == False
+
     print("  ✓ Low-energy hallucinated text is suppressed")
+
+def test_whisper_final_result_preserves_newer_audio():
+    """Test that final results only clear audio covered by their snapshot."""
+    print("\nTest 9: Whisper final result preserves newer audio...")
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        verbose=0
+    )
+
+    engine.audio_buffer = [b"old1", b"old2", b"old3", b"new1", b"new2"]
+    engine.audio_buffer_has_speech = [True, True, False, True, False]
+    engine.last_transcribed_index = 5
+    engine.has_speech = True
+    engine.cumulative_output = "draft"
+
+    engine._queue_transcription_result(
+        text="final old",
+        is_final=True,
+        start_index=0,
+        end_index=3,
+    )
+
+    assert engine.get_transcription_result() == ("final old", True)
+    assert engine.audio_buffer == [b"new1", b"new2"]
+    assert engine.audio_buffer_has_speech == [True, False]
+    assert engine.last_transcribed_index == 2
+    assert engine.has_speech == True
+
+    print("  ✓ Final result does not discard newer audio")
+
+def test_whisper_result_queue_preserves_order():
+    """Test that completed results cannot overwrite each other."""
+    print("\nTest 10: Whisper result queue order...")
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        verbose=0
+    )
+
+    engine._queue_transcription_result(
+        text="first",
+        is_final=False,
+        start_index=0,
+        end_index=1,
+    )
+    engine._queue_transcription_result(
+        text=" second",
+        is_final=False,
+        start_index=1,
+        end_index=2,
+    )
+
+    assert engine.get_transcription_result() == ("first", False)
+    assert engine.get_transcription_result() == ("first second", False)
+
+    print("  ✓ Result queue preserves FIFO order")
+
+def test_whisper_in_flight_task_blocks_new_queue_work():
+    """Test that an in-flight task prevents additional queueing."""
+    print("\nTest 11: Whisper in-flight task blocks queueing...")
+
+    if not HAS_NUMPY:
+        print("  ⚠ Skipping (numpy not available)")
+        return
+
+    engine = WhisperEngine(
+        whisper_model="tiny",
+        whisper_model_dir="/tmp/whisper-models",
+        sample_rate=16000,
+        whisper_silence_duration=0.1,
+        whisper_silence_finalize=0.2,
+        whisper_silence_threshold=0.01,
+        verbose=0
+    )
+
+    speech_chunk = np.full(1600, int(0.02 * 32768), dtype=np.int16).tobytes()
+    silence_chunk = np.zeros(1600, dtype=np.int16).tobytes()
+
+    assert engine.process_audio_chunk(speech_chunk) == False
+    with engine.result_lock:
+        engine.transcription_tasks_in_flight = 1
+
+    assert engine.process_audio_chunk(silence_chunk) == False
+    assert engine.process_audio_chunk(silence_chunk) == False
+    assert engine.transcription_queue.empty()
+    assert engine.last_transcribed_index == 0
+
+    with engine.result_lock:
+        engine.transcription_tasks_in_flight = 0
+
+    print("  ✓ In-flight task state blocks new queue work")
 
 def test_whisper_engine_interface():
     """Test that WhisperEngine implements the STTEngine interface."""
-    print("\nTest 9: STTEngine interface compliance...")
+    print("\nTest 12: STTEngine interface compliance...")
 
     engine = WhisperEngine(
         whisper_model="tiny",
@@ -352,7 +464,7 @@ def test_whisper_engine_interface():
 
 def test_abstract_base_class():
     """Test that STTEngine is properly defined as an abstract base."""
-    print("\nTest 10: STTEngine abstract base class...")
+    print("\nTest 13: STTEngine abstract base class...")
 
     # Try to call abstract methods (should raise NotImplementedError)
     engine = STTEngine()
@@ -385,6 +497,9 @@ def main():
         test_whisper_low_rms_queue_guard()
         test_whisper_speech_chunk_in_low_rms_clip_is_queued()
         test_whisper_low_energy_hallucination_guard()
+        test_whisper_final_result_preserves_newer_audio()
+        test_whisper_result_queue_preserves_order()
+        test_whisper_in_flight_task_blocks_new_queue_work()
         test_whisper_engine_interface()
         model_initialized = test_whisper_engine_initialization()
 
